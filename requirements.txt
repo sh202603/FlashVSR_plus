@@ -1,3 +1,4 @@
+# Keep in sync with [project.dependencies] in pyproject.toml (canonical list).
 gradio
 torch
 torchvision

@@ -40,16 +40,20 @@ cd FlashVSR_plus
 
 #### 2️⃣ Set Up the Python Environment
 
-Create and activate the environment:
+Recommended: [uv](https://docs.astral.sh/uv/). A single command creates `.venv`, installs all dependencies (torch/torchvision come from the PyTorch **cu130** index, configured in `pyproject.toml`) and installs the project in editable mode, which provides the `flashvsr-cli` command:
+
+```bash
+uv sync
+```
+
+> `pyproject.toml` is the canonical dependency list; `requirements.txt` mirrors it for plain-pip users.
+
+Alternatively, set up manually with conda + pip:
 
 ```bash
 conda create -n flashvsr
 conda activate flashvsr
-```
 
-Install project dependencies:
-
-```bash
 # for CUDA 12.8
 pip install -r requirements.txt --index-url https://download.pytorch.org/whl/cu128
 
@@ -79,7 +83,13 @@ CLI example:
 
 ```bash
 python run.py -i ./inputs/example0.mp4 -s 4 ./
+
+# after `uv sync` (or `uv pip install -e .`), the venv also provides a console command:
+flashvsr-cli -i ./inputs/example0.mp4 -s 4 ./
 ```
+
+- `--pad-align` pads the upscaled frame to the next multiple of 128 instead of center-cropping (the default loses up to 127 output pixels per dimension on non-tiled runs), then crops the output back to exactly `scale × input` size. Tiled-DiT runs already preserve the full frame, so the flag is a no-op there.
+
 Or use gradio web ui:  
 
 ```bash

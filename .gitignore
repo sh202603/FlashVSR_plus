@@ -32,6 +32,7 @@ models/FlashVSR-v1.1/
 # Scratch / smoke-test outputs
 _temp/
 _smoke/
+outputs/
 
 # Local Claude Code instructions
 CLAUDE.md
