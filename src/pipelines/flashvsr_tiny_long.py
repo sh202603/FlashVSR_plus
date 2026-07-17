@@ -1,6 +1,7 @@
 import types
 import os
 import time
+import traceback
 from typing import Optional, Tuple, Literal
 
 import torch
@@ -368,11 +369,21 @@ class FlashVSRTinyLongPipeline(BasePipeline):
 
         # 初始化噪声
         if if_buffer:
-            noise = self.generate_noise((1, 16, (num_frames - 1) // 4, height//8, width//8), seed=seed, device=self.device, dtype=self.torch_dtype)
+            noise_shape = (1, 16, (num_frames - 1) // 4, height//8, width//8)
         else:
-            noise = self.generate_noise((1, 16, (num_frames - 1) // 4 + 1, height//8, width//8), seed=seed, device=self.device, dtype=self.torch_dtype)
-        # noise = noise.to(dtype=self.torch_dtype, device=self.device)
-        latents = noise
+            noise_shape = (1, 16, (num_frames - 1) // 4 + 1, height//8, width//8)
+        # The full-clip noise is only ever consumed as small per-chunk slices, so it
+        # lives on CPU (it costs >1 GB of VRAM for multi-minute clips otherwise).
+        # It must still be GENERATED on self.device: a CPU generator has a different
+        # RNG stream, and outputs would no longer be bit-identical to prior versions.
+        try:
+            noise = self.generate_noise(noise_shape, seed=seed, device=self.device, dtype=self.torch_dtype)
+            latents = noise.to("cpu")
+            del noise
+            clean_vram()
+        except torch.OutOfMemoryError:
+            print("[FlashVSR] Not enough VRAM to seed noise on GPU; using CPU RNG (output differs slightly from GPU-seeded runs).")
+            latents = self.generate_noise(noise_shape, seed=seed, device="cpu", dtype=self.torch_dtype)
         
         writer = imageio.get_writer(output_path, fps=fps, quality=quality)
 
@@ -413,7 +424,7 @@ class FlashVSRTinyLongPipeline(BasePipeline):
                         # 合并 LQ latents
                         LQ_latents = [torch.cat([l[i] for l in LQ_latents_list], dim=1) for i in range(len(LQ_latents_list[0]))]
                         LQ_cur_idx = (inner_loop_num - 1) * 4 - 3
-                        cur_latents = latents[:, :, :6, :, :]
+                        cur_latents = latents[:, :, :6, :, :].to(self.device)
                     else:
                         LQ_latents_list = []
                         inner_loop_num = 2
@@ -429,7 +440,7 @@ class FlashVSRTinyLongPipeline(BasePipeline):
                         
                         LQ_latents = [torch.cat([l[i] for l in LQ_latents_list], dim=1) for i in range(len(LQ_latents_list[0]))]
                         LQ_cur_idx = cur_process_idx * 8 + 21 + (inner_loop_num - 2) * 4
-                        cur_latents = latents[:, :, 4 + cur_process_idx * 2 : 6 + cur_process_idx * 2, :, :]
+                        cur_latents = latents[:, :, 4 + cur_process_idx * 2 : 6 + cur_process_idx * 2, :, :].to(self.device)
                     
                     # 推理（无 motion_controller / vace）
                     noise_pred_posi, pre_cache_k, pre_cache_v = model_fn_wan_video(
@@ -484,14 +495,28 @@ class FlashVSRTinyLongPipeline(BasePipeline):
                         del noise_pred_posi, cur_frames, cur_latents, cur_LQ_frame
                         clean_vram()
                     
-                    if hasattr(self.dit, "LQ_proj_in"):
-                        self.dit.LQ_proj_in.clear_cache()
-                        
-                    self.TCDecoder.clean_mem()
+                    # FIX(jasna): do NOT clear the LQ projector cache between chunks.
+                    # Its causal-conv cache must stream across chunks (like the DiT KV
+                    # cache carried via pre_cache_k/v). Clearing it forced a warmup
+                    # (stream_forward returns None on clip_idx==0) on the first steady
+                    # inner iteration, so the steady chunk produced 1 LQ latent frame
+                    # instead of 2 -> `x + LQ_latents[block_id]` 8192-vs-4096 crash.
+                    # if hasattr(self.dit, "LQ_proj_in"):
+                    #     self.dit.LQ_proj_in.clear_cache()
+
+                    # FIX(jasna): do NOT clear the causal TCDecoder memory between
+                    # chunks either. `self.mem` is the decoder's cross-chunk causal
+                    # state and its warmup-trim keys on `self.mem[-8] is None`
+                    # (TCDecoder.decode_video). Clearing it made every steady chunk
+                    # decode as if fresh (re-trim + no causal context from prior
+                    # chunks), degrading steady-state frames to ~17-22 dB vs tiny.
+                    # The pre-loop clean_mem() (once per video) is the correct reset.
+                    # self.TCDecoder.clean_mem()
                     if force_offload:
                         self.offload_model()
     
         except Exception as e:
+            traceback.print_exc()
             print(f"Error: {e}")
             return False
                     
