@@ -6,6 +6,8 @@
 
 **Modified:** lihaoyun6  
 
+**Fork maintainer:** sh202603  
+
 <a href='http://zhuang2002.github.io/FlashVSR'><img src='https://img.shields.io/badge/Project-Page-Green'></a> &nbsp;
 <a href="https://huggingface.co/JunhaoZhuang/FlashVSR"><img src="https://img.shields.io/badge/%F0%9F%A4%97%20Hugging%20Face-Model-blue"></a> &nbsp;
 <a href="https://huggingface.co/datasets/JunhaoZhuang/VSR-120K"><img src="https://img.shields.io/badge/%F0%9F%A4%97%20Hugging%20Face-Dataset-orange"></a> &nbsp;
@@ -23,6 +25,14 @@
 - Support copying audio tracks to output files (powered by FFmpeg). 
 - Introduced Blackwell GPU support for FlashVSR.  
 
+#### 🍴 What's new in this fork
+
+- Streaming tiled-DiT for `tiny-long` mode: frames are read from disk per tile and the output mp4 is stitched chunk-by-chunk, so long/1080p inputs run on 16GB VRAM with flat host-RAM usage (see the *Low VRAM* section below).  
+- Long clips now work correctly in `tiny-long` mode: RoPE frequency tables grow dynamically with clip length, and causal KV caches are carried across chunks (noise stays CPU-resident).  
+- `--pad-align`: preserves frame edges on non-tiled runs instead of center-cropping (also available in the web UI).  
+- New low-VRAM CLI knobs: `--output-height`, `--temp-quality`, `--kv-ratio`.  
+- uv packaging: `uv sync` sets up the whole environment and installs the `flashvsr-cli` console command.  
+
 ---
 ### 🚀 Getting Started
 
@@ -34,7 +44,7 @@ Follow these steps to set up and run **FlashVSR** on your local machine:
 #### 1️⃣ Clone the Repository
 
 ```bash
-git clone https://github.com/lihaoyun6/FlashVSR_plus
+git clone https://github.com/sh202603/FlashVSR_plus
 cd FlashVSR_plus
 ````
 
@@ -77,6 +87,8 @@ pip install -r requirements.txt --index-url https://download.pytorch.org/whl/cu1
 └── README.md
 ```  
 
+- With `-v 11` the pipeline uses [FlashVSR-v1.1](https://huggingface.co/JunhaoZhuang/FlashVSR-v1.1) weights instead, auto-downloaded into `./models/FlashVSR-v1.1/` the same way (default `-v 10` → `./models/FlashVSR/`).  
+
 #### 4️⃣ Run Inference
 
 CLI example:
@@ -88,7 +100,7 @@ python run.py -i ./inputs/example0.mp4 -s 4 ./
 flashvsr-cli -i ./inputs/example0.mp4 -s 4 ./
 ```
 
-- `--pad-align` pads the upscaled frame to the next multiple of 128 instead of center-cropping (the default loses up to 127 output pixels per dimension on non-tiled runs), then crops the output back to exactly `scale × input` size. Tiled-DiT runs already preserve the full frame, so the flag is a no-op there.
+- `--pad-align` pads the upscaled frame to the next multiple of 128 instead of center-cropping (the default loses up to 127 output pixels per dimension on non-tiled runs), then crops the output back to exactly `scale × input` size. Tiled-DiT runs already preserve the full frame, so the flag is a no-op there. The web UI exposes the same option as the *"Preserve full frame"* checkbox.
 
 Or use gradio web ui:  
 
@@ -101,11 +113,12 @@ python webui.py
 In `tiny-long` mode the CLI streams frames from disk per tile and stitches tile videos chunk-by-chunk, so host RAM and VRAM stay flat regardless of clip length:
 
 ```bash
-python run.py -i input.mp4 -m tiny-long --tiled-dit --tile-size 192 --overlap 24 --output-height 2160 ./
+flashvsr-cli -i input.mp4 -m tiny-long --tiled-dit --tile-size 192 --overlap 24 --output-height 2160 -v 11 ./
 ```
 
 - `--tile-size 192` keeps the per-tile GPU footprint around **10 GiB** (measured on an RTX 5080 under Linux). The default 256 needs ~13.5 GiB and is only ~5% faster overall (fewer tiles, but per-tile time scales with tile area), so on 16GB cards there is no reason not to use 192. Per-tile peak VRAM is logged so you can tune this. `tile_size × scale` must be a multiple of 128.
 - `--output-height` downscales the stitched result after blending (the model is 4x-fixed, so a 1080p input otherwise produces a 7680×4320 file).
+- `--kv-ratio` (default 3) sets the KV-cache length of the sparse attention; lowering it saves additional VRAM at some quality cost.
 - Temp tile videos are kept until stitching finishes (`--temp-quality 8` ≈ 0.6 MB/s per tile); the run logs a disk-space estimate at startup.
 - Throughput reality: a 1080p input is split into 84 tiles at tile 192 — measured pace extrapolates to roughly **a day (~23h) per 10 minutes of video** on an RTX 5080. For a ~4× faster, lower-fidelity pass, downscale the input to 540p first and let the 4x model produce 2160p directly.
 - Constant-frame-rate input is recommended; VFR sources may end with a few duplicated tail frames.
