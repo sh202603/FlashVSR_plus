@@ -22,3 +22,16 @@ venv/
 
 # macOS
 .DS_Store
+# Project venv
+.venv/
+
+# Downloaded model weights (posi_prompt.pth stays tracked)
+models/FlashVSR/
+models/FlashVSR-v1.1/
+
+# Scratch / smoke-test outputs
+_temp/
+_smoke/
+
+# Local Claude Code instructions
+CLAUDE.md
