@@ -79,10 +79,11 @@ def next_8n5(n):  # next 8n+5
 def is_video(path): 
     return os.path.isfile(path) and path.lower().endswith(('.mp4','.mov','.avi','.mkv'))
 
-def save_video(frames, save_path, fps=30, quality=5, progress_desc="Saving video..."):
+def save_video(frames, save_path, fps=30, quality=5, progress_desc="Saving video...", macro_block_size=None):
     os.makedirs(os.path.dirname(save_path), exist_ok=True)
     frames_np = (frames.cpu().float() * 255.0).clip(0, 255).numpy().astype(np.uint8)
-    with imageio.get_writer(save_path, fps=fps, quality=quality) as writer:
+    writer_kwargs = {} if macro_block_size is None else {"macro_block_size": macro_block_size}
+    with imageio.get_writer(save_path, fps=fps, quality=quality, **writer_kwargs) as writer:
         for frame_np in tqdm(frames_np, desc=f"[FlashVSR] {progress_desc}"):
             writer.append_data(frame_np)
 
@@ -101,39 +102,70 @@ def prepare_tensors(path: str, dtype=torch.bfloat16):
         return torch.stack(frames, 0), fps
     raise ValueError(f"Unsupported input: {path}")
 
-def get_input_params(image_tensor, scale):
+def compute_scaled_and_padded_dims(w0: int, h0: int, scale: int = 4, multiple: int = 128):
+    """Ceil-to-multiple dims for the pad-align path (mirror of run.py).
+    Returns (sW, sH, tW, tH, pad_left, pad_top); tW >= sW and tH >= sH always."""
+    if w0 <= 0 or h0 <= 0:
+        raise ValueError("invalid original size")
+    sW, sH = w0 * scale, h0 * scale
+    tW = ((sW + multiple - 1) // multiple) * multiple
+    tH = ((sH + multiple - 1) // multiple) * multiple
+    return sW, sH, tW, tH, (tW - sW) // 2, (tH - sH) // 2
+
+def _upscale_pad_or_crop(frame_slice: torch.Tensor, scale: int, tW: int, tH: int, pad_left=None, pad_top=None) -> torch.Tensor:
+    """Bicubic-upscale one HWC frame, then center-crop to (tH, tW), or — when pad
+    offsets are given (pad-align) — pad up to (tH, tW) preserving the edges."""
+    h0, w0, _ = frame_slice.shape
+    tensor_bchw = frame_slice.permute(2, 0, 1).unsqueeze(0)
+    sW, sH = w0 * scale, h0 * scale
+    upscaled_tensor = F.interpolate(tensor_bchw, size=(sH, sW), mode='bicubic', align_corners=False)
+    if pad_left is not None or pad_top is not None:
+        pl = pad_left or 0
+        pt = pad_top or 0
+        pr = max(0, tW - sW - pl)
+        pb = max(0, tH - sH - pt)
+        if pl or pr or pt or pb:
+            # reflect needs pad < dim; fall back to replicate for tiny inputs.
+            mode = 'reflect' if (max(pl, pr) < sW and max(pt, pb) < sH) else 'replicate'
+            upscaled_tensor = F.pad(upscaled_tensor, (pl, pr, pt, pb), mode=mode)
+        return upscaled_tensor.squeeze(0)
+    l, t = max(0, (sW - tW) // 2), max(0, (sH - tH) // 2)
+    return upscaled_tensor[:, :, t:t + tH, l:l + tW].squeeze(0)
+
+def get_input_params(image_tensor, scale, pad_align=False):
     N0, h0, w0, _ = image_tensor.shape
     multiple = 128
-    sW, sH, tW, tH = w0 * scale, h0 * scale, max(multiple, (w0 * scale // multiple) * multiple), max(multiple, (h0 * scale // multiple) * multiple)
+    if pad_align:
+        sW, sH, tW, tH, _, _ = compute_scaled_and_padded_dims(w0, h0, scale=scale, multiple=multiple)
+    else:
+        sW, sH, tW, tH = w0 * scale, h0 * scale, max(multiple, (w0 * scale // multiple) * multiple), max(multiple, (h0 * scale // multiple) * multiple)
     F = largest_8n1_leq(N0 + 4)
     if F == 0: raise RuntimeError(f"Not enough frames. Got {N0 + 4}.")
     return tH, tW, F
 
-def input_tensor_generator(image_tensor: torch.Tensor, device, scale: int = 4, dtype=torch.bfloat16):
+def input_tensor_generator(image_tensor: torch.Tensor, device, scale: int = 4, dtype=torch.bfloat16, pad_align=False):
     N0, h0, w0, _ = image_tensor.shape
-    tH, tW, Fs = get_input_params(image_tensor, scale)
+    tH, tW, Fs = get_input_params(image_tensor, scale, pad_align=pad_align)
+    pad_left = pad_top = None
+    if pad_align:
+        _, _, _, _, pad_left, pad_top = compute_scaled_and_padded_dims(w0, h0, scale=scale)
     for i in range(Fs):
         frame_idx = min(i, N0 - 1)
         frame_slice = image_tensor[frame_idx].to(device)
-        tensor_bchw = frame_slice.permute(2, 0, 1).unsqueeze(0)
-        upscaled_tensor = F.interpolate(tensor_bchw, size=(h0 * scale, w0 * scale), mode='bicubic', align_corners=False)
-        l, t = max(0, (w0 * scale - tW) // 2), max(0, (h0 * scale - tH) // 2)
-        cropped_tensor = upscaled_tensor[:, :, t:t + tH, l:l + tW]
-        tensor_out = (cropped_tensor.squeeze(0) * 2.0 - 1.0)
+        tensor_out = (_upscale_pad_or_crop(frame_slice, scale, tW, tH, pad_left=pad_left, pad_top=pad_top) * 2.0 - 1.0)
         yield tensor_out.to('cpu').to(dtype)
 
-def prepare_input_tensor(image_tensor: torch.Tensor, device, scale: int = 4, dtype=torch.bfloat16):
+def prepare_input_tensor(image_tensor: torch.Tensor, device, scale: int = 4, dtype=torch.bfloat16, pad_align=False):
     N0, h0, w0, _ = image_tensor.shape
-    tH, tW, Fs = get_input_params(image_tensor, scale)
+    tH, tW, Fs = get_input_params(image_tensor, scale, pad_align=pad_align)
+    pad_left = pad_top = None
+    if pad_align:
+        _, _, _, _, pad_left, pad_top = compute_scaled_and_padded_dims(w0, h0, scale=scale)
     frames = []
     for i in range(Fs):
         frame_idx = min(i, N0 - 1)
         frame_slice = image_tensor[frame_idx].to(device)
-        tensor_bchw = frame_slice.permute(2, 0, 1).unsqueeze(0)
-        upscaled_tensor = F.interpolate(tensor_bchw, size=(h0 * scale, w0 * scale), mode='bicubic', align_corners=False)
-        l, t = max(0, (w0 * scale - tW) // 2), max(0, (h0 * scale - tH) // 2)
-        cropped_tensor = upscaled_tensor[:, :, t:t + tH, l:l + tW]
-        tensor_out = (cropped_tensor.squeeze(0) * 2.0 - 1.0).to('cpu').to(dtype)
+        tensor_out = (_upscale_pad_or_crop(frame_slice, scale, tW, tH, pad_left=pad_left, pad_top=pad_top) * 2.0 - 1.0).to('cpu').to(dtype)
         frames.append(tensor_out)
     vid_stacked = torch.stack(frames, 0)
     vid_final = vid_stacked.permute(1, 0, 2, 3).unsqueeze(0)
@@ -289,6 +321,7 @@ def run_flashvsr_integrated(
     sparse_ratio, # New
     kv_ratio,     # New
     local_range,  # New
+    pad_align=False,
     progress=gr.Progress(track_tqdm=True)
 ):
     if not input_path: raise gr.Error("Please provide an input video or image folder path!")
@@ -381,28 +414,39 @@ def run_flashvsr_integrated(
         progress(0.1, desc="Initializing model pipeline...")
         pipe = init_pipeline(model, mode, _device, dtype)
         log(f"Processing {frame_count} frames...", message_type='info')
-    
-        th, tw, F = get_input_params(frames, scale)
+
+        pad_crop_rect = None
+        if pad_align:
+            _h0, _w0 = frames.shape[1], frames.shape[2]
+            sW, sH, ptW, ptH, pl, pt = compute_scaled_and_padded_dims(_w0, _h0, scale=scale)
+            pad_crop_rect = (pt, pl, sH, sW)
+            log(f"Pad-align: processing at {ptW}x{ptH} (padded), output cropped back to {sW}x{sH}.", message_type='info')
+
+        th, tw, F = get_input_params(frames, scale, pad_align=pad_align)
         if mode == "tiny-long":
-            LQ = input_tensor_generator(frames, _device, scale=scale, dtype=dtype)
+            LQ = input_tensor_generator(frames, _device, scale=scale, dtype=dtype, pad_align=pad_align)
             pipe(
-                LQ_video=LQ, num_frames=F, height=th, width=tw, 
+                LQ_video=LQ, num_frames=F, height=th, width=tw,
                 topk_ratio=sparse_ratio*768*1280/(th*tw),
-                output_path=output_path, quality=quality, **pipe_kwargs
+                output_path=output_path, quality=quality, crop_rect=pad_crop_rect, **pipe_kwargs
             )
         else:
-            LQ, _, _, _ = prepare_input_tensor(frames, _device, scale=scale, dtype=dtype)
+            LQ, _, _, _ = prepare_input_tensor(frames, _device, scale=scale, dtype=dtype, pad_align=pad_align)
             LQ = LQ.to(_device)
             video = pipe(
-                LQ_video=LQ, num_frames=F, height=th, width=tw, 
+                LQ_video=LQ, num_frames=F, height=th, width=tw,
                 topk_ratio=sparse_ratio*768*1280/(th*tw), **pipe_kwargs
             )
             final_output_tensor = tensor2video(video).cpu()
+            if pad_crop_rect is not None:
+                _t, _l, _oh, _ow = pad_crop_rect
+                final_output_tensor = final_output_tensor[:, _t:_t + _oh, _l:_l + _ow, :]
         del pipe; clean_vram()
-    
+
     if final_output_tensor is not None:
         progress(0.9, desc="Saving final video...")
-        save_video(final_output_tensor[:frame_count, :, :, :], output_path, fps=_fps, quality=quality)
+        save_video(final_output_tensor[:frame_count, :, :, :], output_path, fps=_fps, quality=quality,
+                   macro_block_size=2 if (pad_align and not tiled_dit) else None)
         
     log(f"Processing complete! Output video saved to: {output_path}", message_type="finish")
     progress(1, desc="Done!")
@@ -441,6 +485,7 @@ def create_ui():
                     color_fix_checkbox = gr.Checkbox(label="Enable Color Fix", value=True)
                     tiled_vae_checkbox = gr.Checkbox(label="Enable Tiled VAE", value=True)
                     unload_dit_checkbox = gr.Checkbox(label="Unload DiT before decoding (saves VRAM)", value=False)
+                    pad_align_checkbox = gr.Checkbox(label="Preserve full frame (pad instead of crop, non-tiled only)", value=False)
                     dtype_radio = gr.Radio(choices=["fp16", "bf16"], value="bf16", label="Data Type")
                     device_textbox = gr.Textbox(value="auto", label="Device", info="e.g., 'auto', 'cuda:0', 'cpu'")
                     quality_slider = gr.Slider(minimum=1, maximum=10, step=1, value=6, label="Output Video Quality")
@@ -454,10 +499,11 @@ def create_ui():
         run_button.click(
             fn=run_flashvsr_integrated,
             inputs=[
-                input_video, model_version, mode_radio, scale_slider, color_fix_checkbox, tiled_vae_checkbox, 
-                tiled_dit_checkbox, tile_size_slider, tile_overlap_slider, unload_dit_checkbox, 
+                input_video, model_version, mode_radio, scale_slider, color_fix_checkbox, tiled_vae_checkbox,
+                tiled_dit_checkbox, tile_size_slider, tile_overlap_slider, unload_dit_checkbox,
                 dtype_radio, seed_number, device_textbox, fps_number, quality_slider, attention_mode_radio,
-                sparse_ratio_slider, kv_ratio_slider, local_range_slider # Added new parameters
+                sparse_ratio_slider, kv_ratio_slider, local_range_slider, # Added new parameters
+                pad_align_checkbox
             ],
             outputs=[video_output]
         )
