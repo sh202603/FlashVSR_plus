@@ -86,6 +86,20 @@ Or use gradio web ui:
 python webui.py
 ```
 
+#### 💾 Low VRAM (16GB) and long 1080p inputs
+
+In `tiny-long` mode the CLI streams frames from disk per tile and stitches tile videos chunk-by-chunk, so host RAM and VRAM stay flat regardless of clip length:
+
+```bash
+python run.py -i input.mp4 -m tiny-long --tiled-dit --tile-size 192 --overlap 24 --output-height 2160 ./
+```
+
+- `--tile-size 192` keeps the per-tile GPU footprint around **10 GiB** (measured on an RTX 5080 under Linux). The default 256 needs ~13.5 GiB and is only ~5% faster overall (fewer tiles, but per-tile time scales with tile area), so on 16GB cards there is no reason not to use 192. Per-tile peak VRAM is logged so you can tune this. `tile_size × scale` must be a multiple of 128.
+- `--output-height` downscales the stitched result after blending (the model is 4x-fixed, so a 1080p input otherwise produces a 7680×4320 file).
+- Temp tile videos are kept until stitching finishes (`--temp-quality 8` ≈ 0.6 MB/s per tile); the run logs a disk-space estimate at startup.
+- Throughput reality: a 1080p input is split into 84 tiles at tile 192 — measured pace extrapolates to roughly **a day (~23h) per 10 minutes of video** on an RTX 5080. For a ~4× faster, lower-fidelity pass, downscale the input to 540p first and let the 4x model produce 2160p directly.
+- Constant-frame-rate input is recommended; VFR sources may end with a few duplicated tail frames.
+
 ---
 
 ### 🤗 Feedback & Support

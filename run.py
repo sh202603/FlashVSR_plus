@@ -21,8 +21,17 @@ parser.add_argument("-d", "--device", type=str, default="auto", help="Device to 
 parser.add_argument("-f", "--fps", type=int, default=30, help="Output FPS (for image sequences only), default=30")
 parser.add_argument("-q", "--quality", type=int, default=6, help="Output video quality, default=6")
 parser.add_argument("-a", "--attention", default="sage", choices=["sage", "block"], help="Attention mode, default=sage")
+parser.add_argument("--output-height", type=int, default=None, help="Downscale the final stitched video to this height (tiled tiny-long only), default=None (native)")
+parser.add_argument("--temp-quality", type=int, default=8, choices=range(1, 11), metavar="[1-10]", help="Quality of per-tile temp videos in tiled tiny-long mode, default=8")
+parser.add_argument("--kv-ratio", type=int, default=3, help="KV cache length of sparse attention; lower saves VRAM at some quality cost, default=3")
 parser.add_argument("output_folder", type=str, help="Path to save output video")
 args = parser.parse_args()
+
+# Reduce CUDA allocator fragmentation for long tiled runs. Must be set before the
+# first CUDA allocation, and never overrides a user-provided allocator config.
+import os
+if sys.platform.startswith("linux") and "PYTORCH_CUDA_ALLOC_CONF" not in os.environ and "PYTORCH_ALLOC_CONF" not in os.environ:
+    os.environ["PYTORCH_CUDA_ALLOC_CONF"] = "expandable_segments:True"
 
 def log(message:str, message_type:str="normal"):
     if message_type == 'error':
@@ -44,6 +53,7 @@ import os
 import re
 import math
 import uuid
+import itertools
 import torch
 import shutil
 import imageio
@@ -147,7 +157,7 @@ def merge_video_with_audio(video_path, audio_source_path):
             try:
                 os.remove(temp)
             except OSError as e:
-                lgo(f"[FlashVSR] Could not remove temporary file '{temp}': {e}", message_type='error')
+                log(f"[FlashVSR] Could not remove temporary file '{temp}': {e}", message_type='error')
     
 def compute_scaled_and_target_dims(w0: int, h0: int, scale: int = 4, multiple: int = 128):
     if w0 <= 0 or h0 <= 0:
@@ -228,6 +238,87 @@ def prepare_tensors(path: str, dtype=torch.bfloat16):
         return vid, fps
     
     raise ValueError(f"Unsupported input: {path}")
+
+def probe_input(path):
+    """Read only the metadata of a video/image-folder input: no frame data is kept.
+    Returns (kind, source, frame_count, height, width, fps); fps is None for folders."""
+    if os.path.isdir(path):
+        paths0 = list_images_natural(path)
+        if not paths0:
+            raise FileNotFoundError(f"No images in {path}")
+        with Image.open(paths0[0]) as img0:
+            w0, h0 = img0.size
+        return "images", paths0, len(paths0), h0, w0, None
+
+    if is_video(path):
+        rdr = imageio.get_reader(path)
+        try:
+            try:
+                meta = rdr.get_meta_data()
+            except Exception:
+                meta = {}
+            first_frame = rdr.get_data(0)
+            h0, w0, _ = first_frame.shape
+
+            fps_val = meta.get('fps', 30)
+            fps = int(round(fps_val)) if isinstance(fps_val, (int, float)) else 30
+
+            total = meta.get('nframes', None)
+            if not isinstance(total, (int, np.integer)) or total <= 0:
+                total = rdr.count_frames()
+            if total is None or total <= 0 or (isinstance(total, float) and not math.isfinite(total)):
+                total = sum(1 for _ in rdr)
+        finally:
+            rdr.close()
+        if total <= 0:
+            raise RuntimeError(f"Cannot read frames from {path}")
+        return "video", path, int(total), h0, w0, fps
+
+    raise ValueError(f"Unsupported input: {path}")
+
+def get_input_params_from_dims(N0, h0, w0, scale):
+    """Same math as padding to 8n+5 in main() followed by get_input_params(), but
+    computed from metadata alone so no frames need to be resident."""
+    multiple = 128
+    sW, sH, tW, tH = compute_scaled_and_target_dims(w0, h0, scale=scale, multiple=multiple)
+    F = largest_8n1_leq(next_8n5(N0) + 4)
+    if F == 0:
+        raise RuntimeError(f"Not enough frames. Got {N0}.")
+    return tH, tW, F
+
+def stream_tile_frames(kind, source, x1, y1, x2, y2, N0, F, device, scale=4, tW=None, tH=None, dtype=torch.bfloat16):
+    """Streaming counterpart of input_tensor_generator for tiny-long: reads frames
+    from disk one at a time, crops the tile region, upscales, and yields F CPU
+    tensors of shape (C, tH, tW) in [-1, 1]. Indices >= N0 repeat the last frame,
+    which matches padding the input to 8n+5 with its final frame."""
+    reader = imageio.get_reader(source) if kind == "video" else None
+    frame_iter = iter(reader) if reader is not None else None
+    last_out = None
+    try:
+        for i in range(F):
+            if i < N0:
+                frame_np = None
+                if kind == "video":
+                    try:
+                        frame_np = np.asarray(next(frame_iter))
+                    except StopIteration:
+                        log(f"[FlashVSR] Input ended early at frame {i}/{N0}; repeating the last frame.", message_type='warning')
+                        N0 = i
+                else:
+                    with Image.open(source[i]) as img:
+                        frame_np = np.array(img.convert('RGB'))
+                if frame_np is not None:
+                    crop_np = frame_np[y1:y2, x1:x2, :3].astype(np.float32) / 255.0
+                    frame_t = torch.from_numpy(crop_np).to(dtype).to(device)
+                    tensor_chw = tensor_upscale_then_center_crop(frame_t, scale=scale, tW=tW, tH=tH)
+                    last_out = (tensor_chw * 2.0 - 1.0).to('cpu').to(dtype)
+                    del frame_t, tensor_chw
+            if last_out is None:
+                raise RuntimeError(f"Cannot read any frames from {source}")
+            yield last_out
+    finally:
+        if reader is not None:
+            reader.close()
 
 def get_input_params(image_tensor, scale):
     N0, h0, w0, _ = image_tensor.shape
@@ -337,103 +428,116 @@ def create_feather_mask(size, overlap):
     return mask
 
 def stitch_video_tiles(
-    tile_paths, 
-    tile_coords, 
-    final_dims, 
-    scale, 
-    overlap, 
-    output_path, 
-    fps, 
-    quality, 
+    tile_paths,
+    tile_coords,
+    final_dims,
+    scale,
+    overlap,
+    output_path,
+    fps,
+    quality,
     cleanup=True,
-    chunk_size=40  # --- 新增参数：每次在内存中处理的帧数 ---
+    chunk_size=40,
+    frame_count=None,
+    output_height=None,
+    ram_budget_gb=8.0,
 ):
     if not tile_paths:
         log("No tile videos found to stitch.", message_type='error')
         return
-    
+
     final_W, final_H = final_dims
-    
-    # 1. 一次性打开所有视频文件
+
     readers = [imageio.get_reader(p) for p in tile_paths]
-    
+
     try:
-        # 获取总帧数
         num_frames = readers[0].count_frames()
-        if num_frames is None or num_frames <= 0:
-            num_frames = len([_ for _ in readers[0]])
-            for r in readers: r.close()
-            readers = [imageio.get_reader(p) for p in tile_paths]
-            
-        # 打开最终的写入器
-        with imageio.get_writer(output_path, fps=fps, quality=quality) as writer:
-            
-            # 2. 按 chunk_size 遍历所有帧
-            # tqdm 现在描述的是处理了多少个“块”
-            for start_frame in tqdm(range(0, num_frames, chunk_size), desc="[FlashVSR] Stitching Chunks"):
-                end_frame = min(start_frame + chunk_size, num_frames)
-                current_chunk_size = end_frame - start_frame
-                
-                # 3. 为整个“块”在内存中创建画布
-                # 形状: (Frames, Height, Width, Channels)
+        if num_frames is None or num_frames <= 0 or (isinstance(num_frames, float) and not math.isfinite(num_frames)):
+            probe_rdr = imageio.get_reader(tile_paths[0])
+            num_frames = sum(1 for _ in probe_rdr)
+            probe_rdr.close()
+        num_frames = int(num_frames)
+        # Tile videos contain 8n+5 padding frames beyond the source length; stop at
+        # frame_count so the padding never reaches the final video.
+        total_frames = num_frames if frame_count is None else min(num_frames, frame_count)
+
+        # The feather masks are time-invariant, so the weight canvas is a single 2-D
+        # plane computed once, not a per-chunk 4-D canvas (which cost chunk_size×
+        # final_H×final_W×3 float32 — ~16GB at 8K — all over again every chunk).
+        masks = []
+        weight_canvas = np.zeros((final_H, final_W, 1), dtype=np.float32)
+        for (x1_orig, y1_orig, x2_orig, y2_orig) in tile_coords:
+            tile_H, tile_W = (y2_orig - y1_orig) * scale, (x2_orig - x1_orig) * scale
+            mask = create_feather_mask_numpy((tile_H, tile_W), overlap * scale)
+            masks.append(mask)
+            out_y1, out_x1 = y1_orig * scale, x1_orig * scale
+            weight_canvas[out_y1:out_y1 + tile_H, out_x1:out_x1 + tile_W, :] += mask
+        weight_canvas[weight_canvas == 0] = 1.0
+
+        bytes_per_frame = final_H * final_W * 3 * 4
+        budget_frames = max(1, int(ram_budget_gb * (1024 ** 3)) // bytes_per_frame)
+        chunk_size = max(1, min(chunk_size, budget_frames))
+
+        out_size = None
+        if output_height is not None:
+            if output_height < final_H:
+                out_h = output_height - (output_height % 2)
+                out_w = int(round(final_W * out_h / final_H / 2)) * 2
+                out_size = (out_h, out_w)
+                log(f"[FlashVSR] Stitching at {final_W}x{final_H}, downscaling output to {out_w}x{out_h}", message_type='info')
+            else:
+                log(f"[FlashVSR] --output-height {output_height} >= native height {final_H}, keeping native resolution.", message_type='warning')
+
+        # One persistent iterator per tile: imageio's iter_data() restarts from
+        # frame 0 on every call, so re-creating it per chunk re-decodes the whole
+        # video each time (O(n²) — hours on multi-minute inputs).
+        iters = [reader.iter_data() for reader in readers]
+
+        with imageio.get_writer(output_path, fps=fps, quality=quality, macro_block_size=2) as writer:
+            for start_frame in tqdm(range(0, total_frames, chunk_size), desc="[FlashVSR] Stitching Chunks"):
+                current_chunk_size = min(chunk_size, total_frames - start_frame)
+
                 chunk_canvas = np.zeros((current_chunk_size, final_H, final_W, 3), dtype=np.float32)
-                weight_canvas = np.zeros_like(chunk_canvas, dtype=np.float32)
-                
-                # 4. 遍历每个分块视频 (tile)
-                for i, reader in enumerate(readers):
-                    # 5. 一次性读取这个 tile 在当前 chunk 中的所有帧
-                    # 这是利用顺序读取的关键优化
-                    try:
-                        # get_reader().iter_data() 是高效读取连续帧的方式
-                        tile_chunk_frames = [
-                            frame.astype(np.float32) / 255.0 
-                            for idx, frame in enumerate(reader.iter_data()) 
-                            if start_frame <= idx < end_frame
-                        ]
-                        # 将帧列表转换为一个 NumPy 数组
-                        tile_chunk_np = np.stack(tile_chunk_frames, axis=0)
-                    except Exception as e:
-                        log(f"Warning: Could not read chunk from tile {i}. Error: {e}", message_type='warning')
-                        continue
-                    
-                    if tile_chunk_np.shape[0] != current_chunk_size:
-                        log(f"Warning: Tile {i} chunk has incorrect frame count. Skipping.", message_type='warning')
-                        continue
-                    
-                    # 6. 创建羽化蒙版 (只需要创建一次)
-                    tile_H, tile_W, _ = tile_chunk_np.shape[1:]
-                    ramp = np.linspace(0, 1, overlap * scale, dtype=np.float32)
-                    mask = np.ones((tile_H, tile_W, 1), dtype=np.float32)
-                    mask[:, :overlap*scale, :] *= ramp[np.newaxis, :, np.newaxis]
-                    mask[:, -overlap*scale:, :] *= np.flip(ramp)[np.newaxis, :, np.newaxis]
-                    mask[:overlap*scale, :, :] *= ramp[:, np.newaxis, np.newaxis]
-                    mask[-overlap*scale:, :, :] *= np.flip(ramp)[:, np.newaxis, np.newaxis]
-                    # 扩展蒙版以匹配 chunk 的帧数维度
-                    mask_4d = mask[np.newaxis, :, :, :] # 形状: (1, H, W, C)
-                    
-                    # 7. 在内存中拼接整个 chunk
+
+                for i, frame_iter in enumerate(iters):
+                    tile_chunk_frames = list(itertools.islice(frame_iter, current_chunk_size))
+                    if len(tile_chunk_frames) != current_chunk_size:
+                        raise RuntimeError(
+                            f"Tile video {i+1} ended early ({start_frame + len(tile_chunk_frames)}/{total_frames} frames) — "
+                            f"the tiled run is incomplete, refusing to write a broken output."
+                        )
+                    tile_chunk_np = np.stack(tile_chunk_frames, axis=0).astype(np.float32) / 255.0
+
+                    tile_H, tile_W = tile_chunk_np.shape[1:3]
+                    if (tile_H, tile_W) != masks[i].shape[:2]:
+                        raise RuntimeError(
+                            f"Tile video {i+1} is {tile_W}x{tile_H}, expected {masks[i].shape[1]}x{masks[i].shape[0]} — "
+                            f"tile_size/scale mismatch."
+                        )
+
                     x1_orig, y1_orig, _, _ = tile_coords[i]
                     out_y1, out_x1 = y1_orig * scale, x1_orig * scale
-                    out_y2, out_x2 = out_y1 + tile_H, out_x1 + tile_W
-                    
-                    # 使用 NumPy 的广播机制 (broadcasting)
-                    chunk_canvas[:, out_y1:out_y2, out_x1:out_x2, :] += tile_chunk_np * mask_4d
-                    weight_canvas[:, out_y1:out_y2, out_x1:out_x2, :] += mask_4d
-                    
-                # 8. 归一化整个 chunk
-                weight_canvas[weight_canvas == 0] = 1.0
-                stitched_chunk = chunk_canvas / weight_canvas
-                
-                # 9. 将这个 chunk 的所有帧一次性写入文件
+                    chunk_canvas[:, out_y1:out_y1 + tile_H, out_x1:out_x1 + tile_W, :] += tile_chunk_np * masks[i][np.newaxis]
+
+                chunk_canvas /= weight_canvas[np.newaxis]
+
                 for frame_idx_in_chunk in range(current_chunk_size):
-                    frame_uint8 = (np.clip(stitched_chunk[frame_idx_in_chunk], 0, 1) * 255).astype(np.uint8)
+                    frame = chunk_canvas[frame_idx_in_chunk]
+                    if out_size is not None:
+                        frame_t = torch.from_numpy(frame).permute(2, 0, 1).unsqueeze(0)
+                        frame_t = F.interpolate(frame_t, size=out_size, mode="area")
+                        frame = frame_t.squeeze(0).permute(1, 2, 0).numpy()
+                    frame_uint8 = (np.clip(frame, 0, 1) * 255).astype(np.uint8)
                     writer.append_data(frame_uint8)
-                    
+
     finally:
         log("Closing all tile reader instances...")
         for reader in readers:
-            reader.close()
-            
+            try:
+                reader.close()
+            except Exception:
+                pass
+
     if cleanup:
         log("Cleaning up temporary tile files...")
         for path in tile_paths:
@@ -495,7 +599,7 @@ def init_pipeline(version, mode, device, dtype):
     
     return pipe
 
-def main(input, version, mode, scale, color_fix, tiled_vae, tiled_dit, tile_size, tile_overlap, unload_dit, dtype, sparse_ratio=2, kv_ratio=3, local_range=11, seed=0, device="auto", quality=6, output=None):
+def main(input, version, mode, scale, color_fix, tiled_vae, tiled_dit, tile_size, tile_overlap, unload_dit, dtype, sparse_ratio=2, kv_ratio=3, local_range=11, seed=0, device="auto", quality=6, output=None, output_height=None, temp_quality=8):
     _device = device
     if device == "auto":
         _device = "cuda:0" if torch.cuda.is_available() else "mps" if torch.backends.mps.is_available() else device
@@ -506,65 +610,107 @@ def main(input, version, mode, scale, color_fix, tiled_vae, tiled_dit, tile_size
         
     if tiled_dit and (tile_overlap > tile_size / 2):
         raise ValueError('The "tile_overlap" must be less than half of "tile_size"!')
-    
-    _frames, fps = prepare_tensors(input, dtype=dtype)
-    _fps = fps if is_video(input) else args.fps
-    
-    add = next_8n5(_frames.shape[0]) - _frames.shape[0]
-    padding_frames = _frames[-1:, :, :, :].repeat(add, 1, 1, 1)
-    frames = torch.cat([_frames, padding_frames], dim=0)
-    frame_count = _frames.shape[0]
-    del _frames
-    clean_vram()
-    
-    log("[FlashVSR] Preparing frames...", message_type="finish")
+    if tiled_dit and tile_overlap <= 0:
+        raise ValueError('The "tile_overlap" must be positive!')
+    if tiled_dit and (tile_size * scale) % 128 != 0:
+        raise ValueError(f'"tile_size" x scale must be a multiple of 128, otherwise tiles get center-cropped and stitching misaligns (for scale {scale} use e.g. {", ".join(str(t) for t in (128, 160, 192, 224, 256) if (t * scale) % 128 == 0)}).')
+
+    if mode == "tiny-long":
+        # tiny-long streams frames from disk per tile instead of preloading the whole
+        # video: a 10-minute 1080p input would need >200GB of RAM as bf16 tensors.
+        kind, source, N0, h0, w0, src_fps = probe_input(input)
+        _fps = src_fps if kind == "video" else args.fps
+        frame_count = N0
+        frames = None
+        log("[FlashVSR] Preparing frames...", message_type="finish")
+    else:
+        _frames, fps = prepare_tensors(input, dtype=dtype)
+        _fps = fps if is_video(input) else args.fps
+
+        add = next_8n5(_frames.shape[0]) - _frames.shape[0]
+        padding_frames = _frames[-1:, :, :, :].repeat(add, 1, 1, 1)
+        frames = torch.cat([_frames, padding_frames], dim=0)
+        frame_count = _frames.shape[0]
+        N0, h0, w0 = frame_count, frames.shape[1], frames.shape[2]
+        del _frames
+        clean_vram()
+
+        log("[FlashVSR] Preparing frames...", message_type="finish")
+
+    if tiled_dit and tile_size > min(h0, w0):
+        raise ValueError(f'"tile_size" ({tile_size}) must not exceed the smaller input dimension ({min(h0, w0)}); use a smaller tile or disable --tiled-dit.')
     
     if tiled_dit:
-        N, H, W, C = frames.shape
-        num_aligned_frames = largest_8n1_leq(N + 4) - 4
-        
         if mode == "tiny-long":
+            H, W = h0, w0
             local_temp = os.path.join(temp, str(uuid.uuid4()))
             os.makedirs(local_temp, exist_ok=True)
         else:
+            N, H, W, C = frames.shape
+            num_aligned_frames = largest_8n1_leq(N + 4) - 4
             final_output_canvas = torch.zeros(
-                (num_aligned_frames, H * scale, W * scale, C), 
-                dtype=dtype, 
+                (num_aligned_frames, H * scale, W * scale, C),
+                dtype=dtype,
                 device="cpu"
             )
             weight_sum_canvas = torch.zeros_like(final_output_canvas)
-            
+
         tile_coords = calculate_tile_coords(H, W, tile_size, tile_overlap)
         latent_tiles_cpu = []
         temp_videos = []
-        
+
+        if _device.startswith("cuda"):
+            free_b, total_b = torch.cuda.mem_get_info()
+            # Linear fit of measured tiny-long footprints (RTX 5080, Linux,
+            # expandable_segments): ~8.7 GiB reserved at 768^2, ~12.3 GiB at 1024^2
+            # (weights + area-proportional KV cache + transients), plus ~1 GiB CUDA
+            # context that lives outside the torch allocator.
+            est_gb = 5.1 + 8.2 * ((tile_size * scale) ** 2) / float(1024 ** 2)
+            log(f"[FlashVSR] {len(tile_coords)} tiles; estimated peak VRAM ~{est_gb:.1f} GiB per tile (free now: {free_b/2**30:.1f} GiB)", message_type='info')
+            if est_gb * (2 ** 30) > free_b * 0.95:
+                log('[FlashVSR] Estimated peak is close to or above free VRAM — consider a smaller --tile-size (192 needs ~11 GiB).', message_type='warning')
+        if mode == "tiny-long" and _fps:
+            est_disk_gb = len(tile_coords) * (frame_count / max(_fps, 1)) * 0.6 * ((tile_size * scale) / 768.0) ** 2 / 1024.0
+            free_disk_gb = shutil.disk_usage(temp).free / 2 ** 30
+            log(f"[FlashVSR] Temp tile videos: ~{est_disk_gb:.1f} GiB estimated, all kept until stitching finishes (free disk: {free_disk_gb:.1f} GiB)", message_type='info')
+            if est_disk_gb > free_disk_gb:
+                log("[FlashVSR] Free disk space may be insufficient for temp tile videos!", message_type='warning')
+
         pipe = init_pipeline(version, mode, _device, dtype)
-        
+        if _device.startswith("cuda"):
+            torch.cuda.reset_peak_memory_stats()
+
         for i, (x1, y1, x2, y2) in enumerate(tile_coords):
-            input_tile = frames[:, y1:y2, x1:x2, :]
-                
+            temp_name = None
+            input_tile = None
             if mode == "tiny-long":
-                temp_name = os.path.join(local_temp, f"{i+1:05d}.mp4") 
-                th, tw, F = get_input_params(input_tile, scale=scale)
-                LQ_tile = input_tensor_generator(input_tile, _device, scale=scale, dtype=dtype)
+                temp_name = os.path.join(local_temp, f"{i+1:05d}.mp4")
+                th, tw, F = get_input_params_from_dims(N0, y2 - y1, x2 - x1, scale)
+                LQ_tile = stream_tile_frames(kind, source, x1, y1, x2, y2, N0, F, _device, scale=scale, tW=tw, tH=th, dtype=dtype)
             else:
+                input_tile = frames[:, y1:y2, x1:x2, :]
                 LQ_tile, th, tw, F = prepare_input_tensor(input_tile, _device, scale=scale, dtype=dtype)
                 LQ_tile = LQ_tile.to(_device)
-            
+
             if i == 0:
                 log(f"[FlashVSR] Processing {frame_count} frames...", message_type='info')
             log(f"[FlashVSR] Processing tile {i+1}/{len(tile_coords)}: ({x1},{y1}) to ({x2},{y2})", message_type='info')
-            
+
             output_tile_gpu = pipe(
                 prompt="", negative_prompt="", cfg_scale=1.0, num_inference_steps=1, seed=seed, tiled=tiled_vae,
                 LQ_video=LQ_tile, num_frames=F, height=th, width=tw, is_full_block=False, if_buffer=True,
                 topk_ratio=sparse_ratio*768*1280/(th*tw), kv_ratio=kv_ratio, local_range=local_range,
-                color_fix=color_fix, unload_dit=unload_dit, fps=_fps, quality=10, output_path=temp_name, tiled_dit=True
+                color_fix=color_fix, unload_dit=unload_dit, fps=_fps, quality=temp_quality, output_path=temp_name, tiled_dit=True
             )
-            
+
+            if _device.startswith("cuda"):
+                log(f"[FlashVSR] Tile {i+1}/{len(tile_coords)} peak VRAM: {torch.cuda.max_memory_allocated()/2**30:.2f} GiB allocated, {torch.cuda.max_memory_reserved()/2**30:.2f} GiB reserved", message_type='info')
+                torch.cuda.reset_peak_memory_stats()
+
             temp_videos.append(temp_name)
             if mode == "tiny-long":
-                final_output = output_tile_gpu
+                if output_tile_gpu is not True:
+                    raise RuntimeError(f"[FlashVSR] Tile {i+1}/{len(tile_coords)} failed — see the error above.")
                 del LQ_tile, input_tile
                 clean_vram()
                 continue
@@ -589,16 +735,20 @@ def main(input, version, mode, scale, color_fix, tiled_vae, tiled_dit, tile_size
         
         if mode == "tiny-long":
             stitch_video_tiles(tile_paths=temp_videos, tile_coords=tile_coords, final_dims=(W * scale, H * scale),
-                scale=scale, overlap=tile_overlap, output_path=output, fps=_fps, quality=quality, cleanup=True
+                scale=scale, overlap=tile_overlap, output_path=output, fps=_fps, quality=quality, cleanup=True,
+                frame_count=frame_count, output_height=output_height
             )
             shutil.rmtree(local_temp)
+            del pipe
+            clean_vram()
+            return None, _fps
         else:
             weight_sum_canvas[weight_sum_canvas == 0] = 1.0
             final_output = final_output_canvas / weight_sum_canvas
     else:
         if mode == "tiny-long":
-            th, tw, F = get_input_params(frames, scale=scale)
-            LQ = input_tensor_generator(frames, _device, scale=scale, dtype=dtype)
+            th, tw, F = get_input_params_from_dims(N0, h0, w0, scale)
+            LQ = stream_tile_frames(kind, source, 0, 0, w0, h0, N0, F, _device, scale=scale, tW=tw, tH=th, dtype=dtype)
         else:
             LQ, th, tw, F = prepare_input_tensor(frames, _device, scale=scale, dtype=dtype)
             LQ = LQ.to(_device)
@@ -609,10 +759,12 @@ def main(input, version, mode, scale, color_fix, tiled_vae, tiled_dit, tile_size
             prompt="", negative_prompt="", cfg_scale=1.0, num_inference_steps=1, seed=seed, tiled=tiled_vae,
             LQ_video=LQ, num_frames=F, height=th, width=tw, is_full_block=False, if_buffer=True,
             topk_ratio=sparse_ratio*768*1280/(th*tw), kv_ratio=kv_ratio, local_range=local_range,
-            color_fix = color_fix, unload_dit=unload_dit, fps=_fps, output_path=output, tiled_dit=True
+            color_fix = color_fix, unload_dit=unload_dit, fps=_fps, quality=quality, output_path=output, tiled_dit=True
         )
-        
+
         if mode == "tiny-long":
+            if video is not True:
+                raise RuntimeError("[FlashVSR] Pipeline failed — see the error above.")
             del pipe, LQ
             clean_vram()
             return video, _fps
@@ -644,9 +796,13 @@ if __name__ == "__main__":
         shutil.rmtree(temp)
     os.makedirs(temp, exist_ok=True)
     name = os.path.basename(args.input.rstrip('/'))
+    # Create the output folder up front: tiny-long writes to it via imageio directly
+    # (no save_video), and a missing folder must not surface only after hours of tiles.
+    os.makedirs(args.output_folder, exist_ok=True)
     final = os.path.join(args.output_folder, f"FlashVSR_{args.mode}_{name.split('.')[0]}_{args.seed}.mp4")
     result, fps = main(args.input, args.version, args.mode, args.scale, args.color_fix, args.tiled_vae, args.tiled_dit,args.tile_size,
-        args.overlap, args.unload_dit, dtype, seed=args.seed, device=args.device, quality=args.quality, output=final)
+        args.overlap, args.unload_dit, dtype, kv_ratio=args.kv_ratio, seed=args.seed, device=args.device, quality=args.quality, output=final,
+        output_height=args.output_height, temp_quality=args.temp_quality)
     if args.mode != "tiny-long":
         save_video(result, final, fps=fps, quality=args.quality)
         
