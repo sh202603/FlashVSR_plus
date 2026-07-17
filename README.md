@@ -30,6 +30,7 @@
 - Streaming tiled-DiT for `tiny-long` mode: frames are read from disk per tile and the output mp4 is stitched chunk-by-chunk, so long/1080p inputs run on 16GB VRAM with flat host-RAM usage (see the *Low VRAM* section below).  
 - Long clips now work correctly in `tiny-long` mode: RoPE frequency tables grow dynamically with clip length, and causal KV caches are carried across chunks (noise stays CPU-resident).  
 - `--pad-align`: preserves frame edges on non-tiled runs instead of center-cropping (also available in the web UI).  
+- `--resume`: crash recovery for tiled `tiny-long` runs — completed tile videos from an interrupted run are detected and reused on re-run.  
 - New low-VRAM CLI knobs: `--output-height`, `--temp-quality`, `--kv-ratio`.  
 - uv packaging: `uv sync` sets up the whole environment and installs the `flashvsr-cli` console command.  
 
@@ -120,6 +121,7 @@ flashvsr-cli -i input.mp4 -m tiny-long --tiled-dit --tile-size 192 --overlap 24 
 - `--output-height` downscales the stitched result after blending (the model is 4x-fixed, so a 1080p input otherwise produces a 7680×4320 file).
 - `--kv-ratio` (default 3) sets the KV-cache length of the sparse attention; lowering it saves additional VRAM at some quality cost.
 - Temp tile videos are kept until stitching finishes (`--temp-quality 8` ≈ 0.6 MB/s per tile); the run logs a disk-space estimate at startup.
+- If a long run crashes or is killed, re-run the same command with `--resume`: completed tiles are verified and skipped, and if all tiles were done the run goes straight to stitching. Changing any parameter that affects tile content (input, seed, tile size, …) starts a fresh tile set instead; stale tiles are cleaned up by the next run without `--resume`.
 - Throughput reality: a 1080p input is split into 84 tiles at tile 192 — measured pace extrapolates to roughly **a day (~23h) per 10 minutes of video** on an RTX 5080. For a ~4× faster, lower-fidelity pass, downscale the input to 540p first and let the 4x model produce 2160p directly.
 - Constant-frame-rate input is recommended; VFR sources may end with a few duplicated tail frames.
 

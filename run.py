@@ -25,6 +25,7 @@ parser.add_argument("--output-height", type=int, default=None, help="Downscale t
 parser.add_argument("--temp-quality", type=int, default=8, choices=range(1, 11), metavar="[1-10]", help="Quality of per-tile temp videos in tiled tiny-long mode, default=8")
 parser.add_argument("--kv-ratio", type=int, default=3, help="KV cache length of sparse attention; lower saves VRAM at some quality cost, default=3")
 parser.add_argument("--pad-align", action="store_true", help="Pad the upscaled frame to the next multiple of 128 instead of center-cropping, then crop the output back to exactly scale*input size — preserves frame edges on non-tiled runs (tiled-DiT already preserves them)")
+parser.add_argument("--resume", action="store_true", help="Resume an interrupted tiled tiny-long run: keep _temp at startup and reuse completed tile videos from a previous run with identical parameters")
 parser.add_argument("output_folder", type=str, help="Path to save output video")
 args = parser.parse_args()
 
@@ -54,6 +55,9 @@ import os
 import re
 import math
 import uuid
+import json
+import hashlib
+import datetime
 import itertools
 import torch
 import shutil
@@ -444,8 +448,125 @@ def calculate_tile_coords(height, width, tile_size, overlap):
                 x1 = max(0, x2 - tile_size)
                 
             coords.append((x1, y1, x2, y2))
-            
+
     return coords
+
+def _input_fingerprint(kind, input_path, source):
+    # st_mtime_ns (int) instead of st_mtime: floats don't survive a JSON round-trip
+    # bit-exactly, which would spuriously invalidate the manifest on every resume.
+    if kind == "images":
+        return {"type": "images", "path": os.path.abspath(input_path),
+                "files": [[os.path.basename(p), os.path.getsize(p)] for p in source]}
+    st = os.stat(input_path)
+    return {"type": "video", "path": os.path.abspath(input_path),
+            "size": st.st_size, "mtime_ns": st.st_mtime_ns}
+
+def build_resume_manifest(kind, input_path, source, frame_count, height, width, scale,
+                          tile_size, tile_overlap, seed, version, mode, dtype, kv_ratio,
+                          local_range, color_fix, sparse_ratio, temp_quality, attention,
+                          fps=None, num_tiles=None):
+    """"params" holds everything that affects tile pixels, coords, ordering or count —
+    two runs with equal params produce interchangeable tile videos. Stitch-only
+    settings (output path/quality/height, fps) must stay out of "params" so changing
+    them doesn't discard resumable tiles; "info" is for human inspection only."""
+    return {
+        "format": 1,
+        "params": {
+            "input": _input_fingerprint(kind, input_path, source),
+            "frame_count": frame_count,
+            "height": height,
+            "width": width,
+            "scale": scale,
+            "tile_size": tile_size,
+            "tile_overlap": tile_overlap,
+            "seed": seed,
+            "version": version,
+            "mode": mode,
+            "dtype": dtype,
+            "kv_ratio": kv_ratio,
+            "local_range": local_range,
+            "color_fix": color_fix,
+            "sparse_ratio": sparse_ratio,
+            "temp_quality": temp_quality,
+            "attention": attention,
+        },
+        "info": {
+            "fps": fps,
+            "num_tiles": num_tiles,
+            "created_at": datetime.datetime.now().isoformat(timespec="seconds"),
+        },
+    }
+
+def resume_manifest_hash(manifest):
+    blob = json.dumps(manifest["params"], sort_keys=True, ensure_ascii=True).encode("utf-8")
+    return hashlib.sha256(blob).hexdigest()[:16]
+
+def count_video_frames(path):
+    """Frame count of a video file, or None if unreadable. Same fallback chain as
+    stitch_video_tiles: count_frames() metadata first, full decode scan if bogus."""
+    try:
+        rdr = imageio.get_reader(path)
+    except Exception:
+        return None
+    try:
+        n = rdr.count_frames()
+        if n is None or n <= 0 or (isinstance(n, float) and not math.isfinite(n)):
+            rdr.close()
+            rdr = imageio.get_reader(path)
+            n = sum(1 for _ in rdr)
+        return int(n)
+    except Exception:
+        return None
+    finally:
+        rdr.close()
+
+def prepare_resume_dir(local_temp, manifest, resume):
+    """Ensure the deterministic tile dir exists. Returns True when `resume` is set and
+    the on-disk manifest's params match exactly (completed tiles may be reused);
+    otherwise the dir is recreated from scratch with a fresh manifest."""
+    manifest_path = os.path.join(local_temp, "manifest.json")
+    if resume and os.path.isdir(local_temp):
+        try:
+            with open(manifest_path) as f:
+                on_disk = json.load(f)
+        except (OSError, ValueError):
+            on_disk = None
+        if isinstance(on_disk, dict) and on_disk.get("params") == manifest["params"]:
+            return True
+        log("[FlashVSR] --resume: previous tiles were made with different parameters — discarding them.", message_type='warning')
+    if os.path.exists(local_temp):
+        shutil.rmtree(local_temp)
+    os.makedirs(local_temp, exist_ok=True)
+    with open(manifest_path, "w") as f:
+        json.dump(manifest, f, indent=2)
+    return False
+
+def scan_completed_tiles(local_temp, num_tiles):
+    """Indices of tiles whose mp4 is fully written: .done marker present and the
+    on-disk frame count matches the count recorded in the marker at completion time.
+    The pipeline closes its writer in a finally block, so a crashed tile leaves a
+    valid-but-truncated mp4 — mere existence is not completion — and how many frames
+    it emits for a given input length is an internal detail (measured, not derived
+    here). Any leftover that fails the checks is deleted so the tile re-encodes."""
+    completed = set()
+    for i in range(num_tiles):
+        mp4 = os.path.join(local_temp, f"{i+1:05d}.mp4")
+        marker = mp4 + ".done"
+        if os.path.exists(mp4) and os.path.exists(marker):
+            try:
+                with open(marker) as f:
+                    recorded = json.load(f).get("frames")
+            except (OSError, ValueError):
+                recorded = None
+            n = count_video_frames(mp4)
+            if isinstance(recorded, int) and n == recorded:
+                completed.add(i)
+                continue
+            log(f"[FlashVSR] Tile {i+1}: {n} frames on disk, marker records {recorded} — will re-encode.", message_type='warning')
+        for path in (mp4, marker):
+            if os.path.exists(path):
+                os.remove(path)
+    return completed
 
 def create_feather_mask_numpy(size, overlap):
     H, W = size
@@ -645,7 +766,7 @@ def init_pipeline(version, mode, device, dtype):
     
     return pipe
 
-def main(input, version, mode, scale, color_fix, tiled_vae, tiled_dit, tile_size, tile_overlap, unload_dit, dtype, sparse_ratio=2, kv_ratio=3, local_range=11, seed=0, device="auto", quality=6, output=None, output_height=None, temp_quality=8, pad_align=False):
+def main(input, version, mode, scale, color_fix, tiled_vae, tiled_dit, tile_size, tile_overlap, unload_dit, dtype, sparse_ratio=2, kv_ratio=3, local_range=11, seed=0, device="auto", quality=6, output=None, output_height=None, temp_quality=8, pad_align=False, resume=False):
     _device = device
     if device == "auto":
         _device = "cuda:0" if torch.cuda.is_available() else "mps" if torch.backends.mps.is_available() else device
@@ -660,6 +781,8 @@ def main(input, version, mode, scale, color_fix, tiled_vae, tiled_dit, tile_size
         raise ValueError('The "tile_overlap" must be positive!')
     if tiled_dit and (tile_size * scale) % 128 != 0:
         raise ValueError(f'"tile_size" x scale must be a multiple of 128, otherwise tiles get center-cropped and stitching misaligns (for scale {scale} use e.g. {", ".join(str(t) for t in (128, 160, 192, 224, 256) if (t * scale) % 128 == 0)}).')
+    if resume and not (tiled_dit and mode == "tiny-long"):
+        log("[FlashVSR] --resume only affects --tiled-dit with -m tiny-long; continuing as a normal run.", message_type='warning')
 
     if mode == "tiny-long":
         # tiny-long streams frames from disk per tile instead of preloading the whole
@@ -692,8 +815,6 @@ def main(input, version, mode, scale, color_fix, tiled_vae, tiled_dit, tile_size
     if tiled_dit:
         if mode == "tiny-long":
             H, W = h0, w0
-            local_temp = os.path.join(temp, str(uuid.uuid4()))
-            os.makedirs(local_temp, exist_ok=True)
         else:
             N, H, W, C = frames.shape
             num_aligned_frames = largest_8n1_leq(N + 4) - 4
@@ -708,6 +829,18 @@ def main(input, version, mode, scale, color_fix, tiled_vae, tiled_dit, tile_size
         latent_tiles_cpu = []
         temp_videos = []
 
+        completed_tiles = set()
+        if mode == "tiny-long":
+            manifest = build_resume_manifest(
+                kind, input, source, N0, h0, w0, scale, tile_size, tile_overlap, seed,
+                version, mode, str(dtype), kv_ratio, local_range, color_fix, sparse_ratio,
+                temp_quality, attention="block" if wan_video_dit.USE_BLOCK_ATTN else "sage",
+                fps=_fps, num_tiles=len(tile_coords))
+            local_temp = os.path.join(temp, "tiles_" + resume_manifest_hash(manifest))
+            if prepare_resume_dir(local_temp, manifest, resume):
+                completed_tiles = scan_completed_tiles(local_temp, len(tile_coords))
+                log(f"[FlashVSR] Resume: {len(completed_tiles)}/{len(tile_coords)} tiles already complete, {len(tile_coords) - len(completed_tiles)} to compute.", message_type='info')
+
         if _device.startswith("cuda"):
             free_b, total_b = torch.cuda.mem_get_info()
             # Linear fit of measured tiny-long footprints (RTX 5080, Linux,
@@ -719,17 +852,25 @@ def main(input, version, mode, scale, color_fix, tiled_vae, tiled_dit, tile_size
             if est_gb * (2 ** 30) > free_b * 0.95:
                 log('[FlashVSR] Estimated peak is close to or above free VRAM — consider a smaller --tile-size (192 needs ~11 GiB).', message_type='warning')
         if mode == "tiny-long" and _fps:
-            est_disk_gb = len(tile_coords) * (frame_count / max(_fps, 1)) * 0.6 * ((tile_size * scale) / 768.0) ** 2 / 1024.0
+            est_disk_gb = (len(tile_coords) - len(completed_tiles)) * (frame_count / max(_fps, 1)) * 0.6 * ((tile_size * scale) / 768.0) ** 2 / 1024.0
             free_disk_gb = shutil.disk_usage(temp).free / 2 ** 30
             log(f"[FlashVSR] Temp tile videos: ~{est_disk_gb:.1f} GiB estimated, all kept until stitching finishes (free disk: {free_disk_gb:.1f} GiB)", message_type='info')
             if est_disk_gb > free_disk_gb:
                 log("[FlashVSR] Free disk space may be insufficient for temp tile videos!", message_type='warning')
 
-        pipe = init_pipeline(version, mode, _device, dtype)
-        if _device.startswith("cuda"):
-            torch.cuda.reset_peak_memory_stats()
+        if mode == "tiny-long" and len(completed_tiles) == len(tile_coords):
+            log("[FlashVSR] All tiles already complete — skipping model load, going straight to stitching.", message_type='info')
+            pipe = None
+        else:
+            pipe = init_pipeline(version, mode, _device, dtype)
+            if _device.startswith("cuda"):
+                torch.cuda.reset_peak_memory_stats()
 
         for i, (x1, y1, x2, y2) in enumerate(tile_coords):
+            if mode == "tiny-long" and i in completed_tiles:
+                temp_videos.append(os.path.join(local_temp, f"{i+1:05d}.mp4"))
+                log(f"[FlashVSR] Skipping tile {i+1}/{len(tile_coords)}: already complete (resume).", message_type='info')
+                continue
             temp_name = None
             input_tile = None
             if mode == "tiny-long":
@@ -760,6 +901,19 @@ def main(input, version, mode, scale, color_fix, tiled_vae, tiled_dit, tile_size
             if mode == "tiny-long":
                 if output_tile_gpu is not True:
                     raise RuntimeError(f"[FlashVSR] Tile {i+1}/{len(tile_coords)} failed — see the error above.")
+                # Written on every run, not just --resume ones: the run that crashes
+                # is usually the one started without the flag. Records the measured
+                # frame count — the pipeline emits fewer frames than its padded input
+                # (an internal detail), so the count cannot be derived here.
+                n_written = count_video_frames(temp_name)
+                if n_written is None:
+                    log(f"[FlashVSR] Could not read back tile {i+1} — resume marker skipped.", message_type='warning')
+                else:
+                    try:
+                        with open(temp_name + ".done", "w") as f:
+                            json.dump({"frames": n_written}, f)
+                    except OSError as e:
+                        log(f"[FlashVSR] Could not write resume marker for tile {i+1}: {e}", message_type='warning')
                 del LQ_tile, input_tile
                 clean_vram()
                 continue
@@ -854,7 +1008,12 @@ def cli_entry():
         wan_video_dit.USE_BLOCK_ATTN = True
 
     if os.path.exists(temp):
-        shutil.rmtree(temp)
+        # --resume must never destroy rescuable tiles, even when the rest of the
+        # command turns out not to match (the manifest check handles that later).
+        if args.resume:
+            log("[FlashVSR] --resume: keeping previous _temp contents.", message_type='info')
+        else:
+            shutil.rmtree(temp)
     os.makedirs(temp, exist_ok=True)
     name = os.path.basename(args.input.rstrip('/'))
     # Create the output folder up front: tiny-long writes to it via imageio directly
@@ -863,7 +1022,7 @@ def cli_entry():
     final = os.path.join(args.output_folder, f"FlashVSR_{args.mode}_{name.split('.')[0]}_{args.seed}.mp4")
     result, fps = main(args.input, args.version, args.mode, args.scale, args.color_fix, args.tiled_vae, args.tiled_dit,args.tile_size,
         args.overlap, args.unload_dit, dtype, kv_ratio=args.kv_ratio, seed=args.seed, device=args.device, quality=args.quality, output=final,
-        output_height=args.output_height, temp_quality=args.temp_quality, pad_align=args.pad_align)
+        output_height=args.output_height, temp_quality=args.temp_quality, pad_align=args.pad_align, resume=args.resume)
     if args.mode != "tiny-long":
         # Cropped-back dims are arbitrary even numbers; macro_block_size=2 stops
         # imageio's default 16px auto-resize (same precedent as stitch_video_tiles).
