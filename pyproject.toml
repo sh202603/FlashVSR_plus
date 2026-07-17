@@ -33,7 +33,7 @@ flashvsr-cli = "run:cli_entry"
 py-modules = ["run", "webui"]
 
 [tool.setuptools.packages.find]
-include = ["src", "src.*"]
+include = ["src", "src.*", "vsrlib"]
 namespaces = true          # src/models/sparse_sage has no __init__.py
 exclude = ["*.__pycache__"]
 
