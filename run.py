@@ -834,7 +834,10 @@ def main(input, version, mode, scale, color_fix, tiled_vae, tiled_dit, tile_size
 
     return final_output[:frame_count, :, :, :], fps
 
-if __name__ == "__main__":
+def cli_entry():
+    """Console entry point (flashvsr-cli). Uses the module-level `args`, which
+    argparse populated from sys.argv at import time — the same flow as
+    `python run.py ...`, so both invocations behave identically."""
     dtype_map = {
         "fp32": torch.float32,
         "fp16": torch.float16,
@@ -868,3 +871,6 @@ if __name__ == "__main__":
 
     merge_video_with_audio(final, args.input)
     log("[FlashVSR] Done.", message_type='finish')
+
+if __name__ == "__main__":
+    cli_entry()

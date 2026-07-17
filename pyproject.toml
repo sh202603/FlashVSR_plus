@@ -1,0 +1,50 @@
+[build-system]
+requires = ["setuptools>=61"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "flashvsr-plus"
+version = "1.1.0"
+description = "FlashVSR+: diffusion-based streaming video super-resolution (inference CLI)"
+requires-python = ">=3.10"
+# Keep in sync with requirements.txt (kept for plain-pip users).
+dependencies = [
+    "gradio",
+    "torch",
+    "torchvision",
+    "numpy",
+    "einops",
+    "safetensors",
+    "tqdm",
+    "pillow",
+    "imageio",
+    "imageio-ffmpeg",
+    "ffmpeg-python",
+    "huggingface_hub",
+    "hf-xet",
+    'triton; platform_system != "Windows"',
+    'triton-windows; platform_system == "Windows"',
+]
+
+[project.scripts]
+flashvsr-cli = "run:cli_entry"
+
+[tool.setuptools]
+py-modules = ["run", "webui"]
+
+[tool.setuptools.packages.find]
+include = ["src", "src.*"]
+namespaces = true          # src/models/sparse_sage has no __init__.py
+exclude = ["*.__pycache__"]
+
+# CUDA builds must come from the PyTorch cu130 index, not PyPI.
+# NOTE: tool.uv.sources is honored by the uv project workflow (`uv sync`),
+# not by `uv pip install`.
+[[tool.uv.index]]
+name = "pytorch-cu130"
+url = "https://download.pytorch.org/whl/cu130"
+explicit = true
+
+[tool.uv.sources]
+torch = { index = "pytorch-cu130" }
+torchvision = { index = "pytorch-cu130" }
