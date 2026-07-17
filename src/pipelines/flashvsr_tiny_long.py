@@ -335,8 +335,12 @@ class FlashVSRTinyLongPipeline(BasePipeline):
         fps=30,
         quality=6,
         output_path=None,
+        crop_rect=None,
         **kwargs,
     ):
+        # crop_rect: optional (top, left, out_h, out_w) in output pixels. When set
+        # (run.py --pad-align), decoded frames are cropped back to the original
+        # scale*input size before being written. None keeps behavior byte-identical.
         # 只接受 cfg=1.0（与原代码一致）
         assert cfg_scale == 1.0, "cfg_scale must be 1.0"
         
@@ -385,7 +389,14 @@ class FlashVSRTinyLongPipeline(BasePipeline):
             print("[FlashVSR] Not enough VRAM to seed noise on GPU; using CPU RNG (output differs slightly from GPU-seeded runs).")
             latents = self.generate_noise(noise_shape, seed=seed, device="cpu", dtype=self.torch_dtype)
         
-        writer = imageio.get_writer(output_path, fps=fps, quality=quality)
+        if crop_rect is None:
+            # Keep this exact call unchanged: external callers monkeypatch
+            # imageio.get_writer and may not accept extra kwargs.
+            writer = imageio.get_writer(output_path, fps=fps, quality=quality)
+        else:
+            # Cropped dims are arbitrary even numbers; macro_block_size=2 stops
+            # imageio's default 16px auto-resize.
+            writer = imageio.get_writer(output_path, fps=fps, quality=quality, macro_block_size=2)
 
         process_total_num = (num_frames - 1) // 8 - 2
         is_stream = True
@@ -483,6 +494,10 @@ class FlashVSRTinyLongPipeline(BasePipeline):
                     except:
                         pass
                     
+                    if crop_rect is not None:
+                        _t, _l, _oh, _ow = crop_rect
+                        cur_frames = cur_frames[:, :, :, _t:_t + _oh, _l:_l + _ow]
+
                     num_frames_in_chunk = cur_frames.shape[2]
                     for i in range(num_frames_in_chunk):
                         single_frame_tensor = cur_frames[0, :, i, :, :]
