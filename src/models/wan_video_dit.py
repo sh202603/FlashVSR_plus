@@ -626,9 +626,25 @@ class WanModel(torch.nn.Module):
         self.head = Head(dim, out_dim, patch_size, eps)
 
         head_dim = dim // num_heads
+        self.head_dim = head_dim
         self.freqs = precompute_freqs_cis_3d(head_dim)
 
         self._cross_kv_initialized = False
+
+    def ensure_freqs_end(self, end: int):
+        # The RoPE tables are precomputed for 1024 positions; streaming
+        # pipelines index the temporal table by absolute latent-frame position,
+        # so clips longer than ~4097 input frames slice past the end. An
+        # out-of-range slice is empty, which silently drops the temporal
+        # component and crashes rope_apply with a head-dim mismatch (64 vs 42).
+        # Grow geometrically so steady-state chunks rebuild the table at most
+        # a handful of times per clip.
+        cur_end = self.freqs[0].shape[0]
+        if end <= cur_end:
+            return
+        new_end = max(end, cur_end * 2)
+        device = self.freqs[0].device
+        self.freqs = tuple(t.to(device) for t in precompute_freqs_cis_3d(self.head_dim, end=new_end))
 
     # 可选：手动清空 / 重新初始化
     def clear_cross_kv(self):

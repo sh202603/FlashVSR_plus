@@ -567,7 +567,10 @@ def model_fn_wan_video(
     topk = int(square_num * topk_ratio) - 1
     kv_len = int(kv_ratio)
 
-    # RoPE 位置（分段）
+    # RoPE 位置（分段）— the temporal table is indexed by absolute latent-frame
+    # position, so it must cover the current chunk (clips beyond ~4097 input
+    # frames outgrow the default 1024-entry table).
+    dit.ensure_freqs_end(f if cur_process_idx == 0 else 4 + cur_process_idx * 2 + f)
     if cur_process_idx == 0:
         freqs = torch.cat([
             dit.freqs[0][:f].view(f, 1, 1, -1).expand(f, h, w, -1),
