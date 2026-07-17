@@ -24,6 +24,7 @@ parser.add_argument("-a", "--attention", default="sage", choices=["sage", "block
 parser.add_argument("--output-height", type=int, default=None, help="Downscale the final stitched video to this height (tiled tiny-long only), default=None (native)")
 parser.add_argument("--temp-quality", type=int, default=8, choices=range(1, 11), metavar="[1-10]", help="Quality of per-tile temp videos in tiled tiny-long mode, default=8")
 parser.add_argument("--kv-ratio", type=int, default=3, help="KV cache length of sparse attention; lower saves VRAM at some quality cost, default=3")
+parser.add_argument("--pad-align", action="store_true", help="Pad the upscaled frame to the next multiple of 128 instead of center-cropping, then crop the output back to exactly scale*input size — preserves frame edges on non-tiled runs (tiled-DiT already preserves them)")
 parser.add_argument("output_folder", type=str, help="Path to save output video")
 args = parser.parse_args()
 
@@ -114,10 +115,13 @@ def next_8n5(n):  # next 8n+5
 def is_video(path): 
     return os.path.isfile(path) and path.lower().endswith(('.mp4','.mov','.avi','.mkv'))
 
-def save_video(frames, save_path, fps=30, quality=5):
+def save_video(frames, save_path, fps=30, quality=5, macro_block_size=None):
     os.makedirs(os.path.dirname(save_path), exist_ok=True)
     frames_np = (frames.cpu().float() * 255.0).clip(0, 255).numpy().astype(np.uint8)
-    w = imageio.get_writer(save_path, fps=fps, quality=quality)
+    # macro_block_size is only forwarded when explicitly requested so the default
+    # writer call stays identical for existing callers.
+    writer_kwargs = {} if macro_block_size is None else {"macro_block_size": macro_block_size}
+    w = imageio.get_writer(save_path, fps=fps, quality=quality, **writer_kwargs)
     for frame_np in tqdm(frames_np, desc=f"[FlashVSR] Saving video"):
         w.append_data(frame_np)
     w.close()
@@ -168,17 +172,41 @@ def compute_scaled_and_target_dims(w0: int, h0: int, scale: int = 4, multiple: i
     tH = max(multiple, (sH // multiple) * multiple)
     return sW, sH, tW, tH
 
-def tensor_upscale_then_center_crop(frame_tensor: torch.Tensor, scale: int, tW: int, tH: int) -> torch.Tensor:
+def compute_scaled_and_padded_dims(w0: int, h0: int, scale: int = 4, multiple: int = 128):
+    """Ceil-to-multiple counterpart of compute_scaled_and_target_dims (--pad-align).
+    Returns (sW, sH, tW, tH, pad_left, pad_top); tW >= sW and tH >= sH always,
+    so the frame is padded up instead of center-cropped and no edge is lost."""
+    if w0 <= 0 or h0 <= 0:
+        raise ValueError("invalid original size")
+
+    sW, sH = w0 * scale, h0 * scale
+    tW = ((sW + multiple - 1) // multiple) * multiple
+    tH = ((sH + multiple - 1) // multiple) * multiple
+    return sW, sH, tW, tH, (tW - sW) // 2, (tH - sH) // 2
+
+def tensor_upscale_then_center_crop(frame_tensor: torch.Tensor, scale: int, tW: int, tH: int, pad_left=None, pad_top=None) -> torch.Tensor:
     h0, w0, c = frame_tensor.shape
     tensor_bchw = frame_tensor.permute(2, 0, 1).unsqueeze(0) # HWC -> CHW -> BCHW
-    
+
     sW, sH = w0 * scale, h0 * scale
     upscaled_tensor = F.interpolate(tensor_bchw, size=(sH, sW), mode='bicubic', align_corners=False)
-    
+
+    if pad_left is not None or pad_top is not None:
+        # pad-align path: pad up to (tH, tW) instead of cropping, preserving edges.
+        pl = pad_left or 0
+        pt = pad_top or 0
+        pr = max(0, tW - sW - pl)
+        pb = max(0, tH - sH - pt)
+        if pl or pr or pt or pb:
+            # reflect needs pad < dim; fall back to replicate for tiny inputs.
+            mode = 'reflect' if (max(pl, pr) < sW and max(pt, pb) < sH) else 'replicate'
+            upscaled_tensor = F.pad(upscaled_tensor, (pl, pr, pt, pb), mode=mode)
+        return upscaled_tensor.squeeze(0)
+
     l = max(0, (sW - tW) // 2)
     t = max(0, (sH - tH) // 2)
     cropped_tensor = upscaled_tensor[:, :, t:t + tH, l:l + tW]
-    
+
     return cropped_tensor.squeeze(0)
 
 def prepare_tensors(path: str, dtype=torch.bfloat16):
@@ -276,21 +304,29 @@ def probe_input(path):
 
     raise ValueError(f"Unsupported input: {path}")
 
-def get_input_params_from_dims(N0, h0, w0, scale):
+def get_input_params_from_dims(N0, h0, w0, scale, pad_align=False):
     """Same math as padding to 8n+5 in main() followed by get_input_params(), but
     computed from metadata alone so no frames need to be resident."""
     multiple = 128
-    sW, sH, tW, tH = compute_scaled_and_target_dims(w0, h0, scale=scale, multiple=multiple)
+    if pad_align:
+        sW, sH, tW, tH, _, _ = compute_scaled_and_padded_dims(w0, h0, scale=scale, multiple=multiple)
+    else:
+        sW, sH, tW, tH = compute_scaled_and_target_dims(w0, h0, scale=scale, multiple=multiple)
     F = largest_8n1_leq(next_8n5(N0) + 4)
     if F == 0:
         raise RuntimeError(f"Not enough frames. Got {N0}.")
     return tH, tW, F
 
-def stream_tile_frames(kind, source, x1, y1, x2, y2, N0, F, device, scale=4, tW=None, tH=None, dtype=torch.bfloat16):
+def stream_tile_frames(kind, source, x1, y1, x2, y2, N0, F, device, scale=4, tW=None, tH=None, dtype=torch.bfloat16, pad_align=False):
     """Streaming counterpart of input_tensor_generator for tiny-long: reads frames
     from disk one at a time, crops the tile region, upscales, and yields F CPU
     tensors of shape (C, tH, tW) in [-1, 1]. Indices >= N0 repeat the last frame,
     which matches padding the input to 8n+5 with its final frame."""
+    pad_left = pad_top = None
+    if pad_align:
+        # Centered padding offsets up to the ceil-aligned (tH, tW).
+        pad_left = max(0, (tW - (x2 - x1) * scale) // 2)
+        pad_top = max(0, (tH - (y2 - y1) * scale) // 2)
     reader = imageio.get_reader(source) if kind == "video" else None
     frame_iter = iter(reader) if reader is not None else None
     last_out = None
@@ -310,7 +346,7 @@ def stream_tile_frames(kind, source, x1, y1, x2, y2, N0, F, device, scale=4, tW=
                 if frame_np is not None:
                     crop_np = frame_np[y1:y2, x1:x2, :3].astype(np.float32) / 255.0
                     frame_t = torch.from_numpy(crop_np).to(dtype).to(device)
-                    tensor_chw = tensor_upscale_then_center_crop(frame_t, scale=scale, tW=tW, tH=tH)
+                    tensor_chw = tensor_upscale_then_center_crop(frame_t, scale=scale, tW=tW, tH=tH, pad_left=pad_left, pad_top=pad_top)
                     last_out = (tensor_chw * 2.0 - 1.0).to('cpu').to(dtype)
                     del frame_t, tensor_chw
             if last_out is None:
@@ -320,51 +356,61 @@ def stream_tile_frames(kind, source, x1, y1, x2, y2, N0, F, device, scale=4, tW=
         if reader is not None:
             reader.close()
 
-def get_input_params(image_tensor, scale):
+def get_input_params(image_tensor, scale, pad_align=False):
     N0, h0, w0, _ = image_tensor.shape
-    
+
     multiple = 128
-    sW, sH, tW, tH = compute_scaled_and_target_dims(w0, h0, scale=scale, multiple=multiple)
+    if pad_align:
+        sW, sH, tW, tH, _, _ = compute_scaled_and_padded_dims(w0, h0, scale=scale, multiple=multiple)
+    else:
+        sW, sH, tW, tH = compute_scaled_and_target_dims(w0, h0, scale=scale, multiple=multiple)
     num_frames_with_padding = N0 + 4
     F = largest_8n1_leq(num_frames_with_padding)
-    
+
     if F == 0:
         raise RuntimeError(f"Not enough frames after padding. Got {num_frames_with_padding}.")
-    
+
     return tH, tW, F
 
-def input_tensor_generator(image_tensor: torch.Tensor, device, scale: int = 4, dtype=torch.bfloat16):
+def input_tensor_generator(image_tensor: torch.Tensor, device, scale: int = 4, dtype=torch.bfloat16, pad_align=False):
     """
     一个生成器函数，逐帧处理并 yield 准备好的帧张量，以节省内存。
     产出的每个张量形状为 (C, H, W)。
     """
     N0, h0, w0, _ = image_tensor.shape
-    tH, tW, F = get_input_params(image_tensor, scale)
-        
+    tH, tW, F = get_input_params(image_tensor, scale, pad_align=pad_align)
+    pad_left = pad_top = None
+    if pad_align:
+        _, _, _, _, pad_left, pad_top = compute_scaled_and_padded_dims(w0, h0, scale=scale)
+
     for i in range(F):
         frame_idx = min(i, N0 - 1)
         frame_slice = image_tensor[frame_idx].to(device)
-        tensor_chw = tensor_upscale_then_center_crop(frame_slice, scale=scale, tW=tW, tH=tH)
+        tensor_chw = tensor_upscale_then_center_crop(frame_slice, scale=scale, tW=tW, tH=tH, pad_left=pad_left, pad_top=pad_top)
         tensor_out = tensor_chw * 2.0 - 1.0
         del tensor_chw
         yield tensor_out.to('cpu').to(dtype)
 
-def prepare_input_tensor(image_tensor: torch.Tensor, device, scale: int = 4, dtype=torch.bfloat16):
+def prepare_input_tensor(image_tensor: torch.Tensor, device, scale: int = 4, dtype=torch.bfloat16, pad_align=False):
     N0, h0, w0, _ = image_tensor.shape
-    
+
     multiple = 128
-    sW, sH, tW, tH = compute_scaled_and_target_dims(w0, h0, scale=scale, multiple=multiple)
+    pad_left = pad_top = None
+    if pad_align:
+        sW, sH, tW, tH, pad_left, pad_top = compute_scaled_and_padded_dims(w0, h0, scale=scale, multiple=multiple)
+    else:
+        sW, sH, tW, tH = compute_scaled_and_target_dims(w0, h0, scale=scale, multiple=multiple)
     num_frames_with_padding = N0 + 4
     F = largest_8n1_leq(num_frames_with_padding)
-    
+
     if F == 0:
         raise RuntimeError(f"Not enough frames after padding. Got {num_frames_with_padding}.")
-        
+
     frames = []
     for i in range(F):
         frame_idx = min(i, N0 - 1)
         frame_slice = image_tensor[frame_idx].to(device)
-        tensor_chw = tensor_upscale_then_center_crop(frame_slice, scale=scale, tW=tW, tH=tH)
+        tensor_chw = tensor_upscale_then_center_crop(frame_slice, scale=scale, tW=tW, tH=tH, pad_left=pad_left, pad_top=pad_top)
         tensor_out = tensor_chw * 2.0 - 1.0
         tensor_out = tensor_out.to('cpu').to(dtype)
         frames.append(tensor_out)
@@ -599,7 +645,7 @@ def init_pipeline(version, mode, device, dtype):
     
     return pipe
 
-def main(input, version, mode, scale, color_fix, tiled_vae, tiled_dit, tile_size, tile_overlap, unload_dit, dtype, sparse_ratio=2, kv_ratio=3, local_range=11, seed=0, device="auto", quality=6, output=None, output_height=None, temp_quality=8):
+def main(input, version, mode, scale, color_fix, tiled_vae, tiled_dit, tile_size, tile_overlap, unload_dit, dtype, sparse_ratio=2, kv_ratio=3, local_range=11, seed=0, device="auto", quality=6, output=None, output_height=None, temp_quality=8, pad_align=False):
     _device = device
     if device == "auto":
         _device = "cuda:0" if torch.cuda.is_available() else "mps" if torch.backends.mps.is_available() else device
@@ -639,7 +685,10 @@ def main(input, version, mode, scale, color_fix, tiled_vae, tiled_dit, tile_size
 
     if tiled_dit and tile_size > min(h0, w0):
         raise ValueError(f'"tile_size" ({tile_size}) must not exceed the smaller input dimension ({min(h0, w0)}); use a smaller tile or disable --tiled-dit.')
-    
+
+    if pad_align and tiled_dit:
+        log("[FlashVSR] --pad-align has no effect on the tiled-DiT path (tiles already preserve the full frame).", message_type='info')
+
     if tiled_dit:
         if mode == "tiny-long":
             H, W = h0, w0
@@ -746,11 +795,16 @@ def main(input, version, mode, scale, color_fix, tiled_vae, tiled_dit, tile_size
             weight_sum_canvas[weight_sum_canvas == 0] = 1.0
             final_output = final_output_canvas / weight_sum_canvas
     else:
+        pad_crop_rect = None
+        if pad_align:
+            sW, sH, ptW, ptH, pl, pt = compute_scaled_and_padded_dims(w0, h0, scale=scale)
+            pad_crop_rect = (pt, pl, sH, sW)
+            log(f"[FlashVSR] --pad-align: processing at {ptW}x{ptH} (padded), output cropped back to {sW}x{sH}.", message_type='info')
         if mode == "tiny-long":
-            th, tw, F = get_input_params_from_dims(N0, h0, w0, scale)
-            LQ = stream_tile_frames(kind, source, 0, 0, w0, h0, N0, F, _device, scale=scale, tW=tw, tH=th, dtype=dtype)
+            th, tw, F = get_input_params_from_dims(N0, h0, w0, scale, pad_align=pad_align)
+            LQ = stream_tile_frames(kind, source, 0, 0, w0, h0, N0, F, _device, scale=scale, tW=tw, tH=th, dtype=dtype, pad_align=pad_align)
         else:
-            LQ, th, tw, F = prepare_input_tensor(frames, _device, scale=scale, dtype=dtype)
+            LQ, th, tw, F = prepare_input_tensor(frames, _device, scale=scale, dtype=dtype, pad_align=pad_align)
             LQ = LQ.to(_device)
 
         pipe = init_pipeline(version, mode, _device, dtype)
@@ -759,7 +813,8 @@ def main(input, version, mode, scale, color_fix, tiled_vae, tiled_dit, tile_size
             prompt="", negative_prompt="", cfg_scale=1.0, num_inference_steps=1, seed=seed, tiled=tiled_vae,
             LQ_video=LQ, num_frames=F, height=th, width=tw, is_full_block=False, if_buffer=True,
             topk_ratio=sparse_ratio*768*1280/(th*tw), kv_ratio=kv_ratio, local_range=local_range,
-            color_fix = color_fix, unload_dit=unload_dit, fps=_fps, quality=quality, output_path=output, tiled_dit=True
+            color_fix = color_fix, unload_dit=unload_dit, fps=_fps, quality=quality, output_path=output, tiled_dit=True,
+            crop_rect=pad_crop_rect if mode == "tiny-long" else None
         )
 
         if mode == "tiny-long":
@@ -768,12 +823,15 @@ def main(input, version, mode, scale, color_fix, tiled_vae, tiled_dit, tile_size
             del pipe, LQ
             clean_vram()
             return video, _fps
-        
+
         log("[FlashVSR] Preparing frames...")
         final_output = tensor2video(video).to("cpu")
+        if pad_crop_rect is not None:
+            _t, _l, _oh, _ow = pad_crop_rect
+            final_output = final_output[:, _t:_t + _oh, _l:_l + _ow, :]
         del pipe, video, LQ
         clean_vram()
-    
+
     return final_output[:frame_count, :, :, :], fps
 
 if __name__ == "__main__":
@@ -786,12 +844,12 @@ if __name__ == "__main__":
         dtype = dtype_map[args.dtype]
     except:
         dtype = torch.bfloat16
-        
+
     if args.attention == "sage":
         wan_video_dit.USE_BLOCK_ATTN = False
     else:
         wan_video_dit.USE_BLOCK_ATTN = True
-    
+
     if os.path.exists(temp):
         shutil.rmtree(temp)
     os.makedirs(temp, exist_ok=True)
@@ -802,9 +860,11 @@ if __name__ == "__main__":
     final = os.path.join(args.output_folder, f"FlashVSR_{args.mode}_{name.split('.')[0]}_{args.seed}.mp4")
     result, fps = main(args.input, args.version, args.mode, args.scale, args.color_fix, args.tiled_vae, args.tiled_dit,args.tile_size,
         args.overlap, args.unload_dit, dtype, kv_ratio=args.kv_ratio, seed=args.seed, device=args.device, quality=args.quality, output=final,
-        output_height=args.output_height, temp_quality=args.temp_quality)
+        output_height=args.output_height, temp_quality=args.temp_quality, pad_align=args.pad_align)
     if args.mode != "tiny-long":
-        save_video(result, final, fps=fps, quality=args.quality)
-        
+        # Cropped-back dims are arbitrary even numbers; macro_block_size=2 stops
+        # imageio's default 16px auto-resize (same precedent as stitch_video_tiles).
+        save_video(result, final, fps=fps, quality=args.quality, macro_block_size=2 if args.pad_align else None)
+
     merge_video_with_audio(final, args.input)
     log("[FlashVSR] Done.", message_type='finish')
