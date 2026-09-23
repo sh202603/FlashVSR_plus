@@ -1,14 +1,19 @@
 """Opt-in inference acceleration with automatic fallback to the stock bf16 path.
 
 Parts (each gated separately; see README "Acceleration"):
-  fp8_conv_tcd  TCDecoder convolutions in FP8 (cuDNN graph API)
   fp8_conv_lq   LQ projector conv3d in FP8 (cuDNN graph API)
   fp8_dit       DiT linears / FFN in FP8 (torch._scaled_mm + Triton quantization)
   fused_dit     DiT RMSNorm+RoPE and AdaLN fused Triton kernels (bf16)
+  fp8_conv_tcd  TCDecoder convolutions in FP8 (cuDNN graph API) -- opt-in only
 
-Environment: FLASHVSR_ACCEL=1 requests all parts (run.py --accel sets it);
-FLASHVSR_FP8_CONV / FLASHVSR_FP8_DIT / FLASHVSR_FUSED_DIT =1 request one group,
-=0 removes it even under FLASHVSR_ACCEL=1. Nothing set: nothing changes.
+Environment: FLASHVSR_ACCEL=1 requests the first three (run.py --accel sets it);
+FLASHVSR_FP8_CONV / FLASHVSR_FP8_DIT / FLASHVSR_FUSED_DIT =1 request one of them,
+=0 removes it even under FLASHVSR_ACCEL=1. fp8_conv_tcd is left out of
+FLASHVSR_ACCEL and runs only with FLASHVSR_FP8_CONV_TCD=1: the TCDecoder
+synthesizes the output pixels, and FP8's 3-bit mantissa turns smooth feature
+gradients into steps, visible as contour banding on skin and other flat areas
+(its warping-error / flat-area error was 2-3x that of the other parts).
+Nothing set: nothing changes.
 
 Every part changes the output, so a part that can't run must leave the stock
 code path untouched (not a rewritten bf16 imitation of the fast path): a run
@@ -32,8 +37,9 @@ import torch  # noqa: E402  (vsrlib.common first: allocator env var)
 # implementation are not reused.
 PART_VERSIONS = {"fp8_conv_tcd": 1, "fp8_conv_lq": 1, "fp8_dit": 1, "fused_dit": 1}
 PARTS = tuple(PART_VERSIONS)
-_ENV = {"fp8_conv_tcd": "FLASHVSR_FP8_CONV", "fp8_conv_lq": "FLASHVSR_FP8_CONV",
+_ENV = {"fp8_conv_tcd": "FLASHVSR_FP8_CONV_TCD", "fp8_conv_lq": "FLASHVSR_FP8_CONV",
         "fp8_dit": "FLASHVSR_FP8_DIT", "fused_dit": "FLASHVSR_FUSED_DIT"}
+_OPT_IN = frozenset({"fp8_conv_tcd"})  # never enabled by FLASHVSR_ACCEL / enable_all
 _CONV = ("fp8_conv_tcd", "fp8_conv_lq")
 _DEFAULT_SHAPE = (512, 512)  # warmup output size when the caller doesn't know it
 
@@ -61,12 +67,13 @@ def _device_capability(dev):
 
 
 def requested_parts(enable_all=False):
-    """Parts requested by the environment (or all, when enable_all), minus =0."""
+    """Parts requested by the environment (or by enable_all), minus =0. Opt-in
+    parts need their own variable set to 1."""
     all_on = enable_all or os.environ.get("FLASHVSR_ACCEL") == "1"
     parts = set()
     for p in PARTS:
         v = os.environ.get(_ENV[p])
-        if v == "1" or (all_on and v != "0"):
+        if v == "1" or (all_on and v != "0" and p not in _OPT_IN):
             parts.add(p)
     return parts
 

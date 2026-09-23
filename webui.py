@@ -300,8 +300,8 @@ def init_pipeline(model, mode, device, dtype, accel=False, accel_shape=None):
     pipe.to(device, dtype=dtype); pipe.enable_vram_management(); pipe.init_cross_kv(prompt_path=prompt_path); pipe.load_models_to_device(["dit", "vae"])
     # Acceleration is shared with the CLI (vsrlib.accel) rather than duplicated:
     # its checks, fallback and runtime demotion must behave the same everywhere.
-    # The checkbox requests every part; FLASHVSR_* env vars still apply (=0
-    # removes one). install() also runs when off, clearing hooks an earlier
+    # The checkbox requests the same parts as --accel; FLASHVSR_* env vars still
+    # apply (=0 removes one, FLASHVSR_FP8_CONV_TCD=1 adds the opt-in TCDecoder part). install() also runs when off, clearing hooks an earlier
     # accelerated run left in this process.
     from vsrlib import accel as vsr_accel
     version = "10" if model == "FlashVSR" else "11"
