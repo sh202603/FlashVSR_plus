@@ -151,6 +151,8 @@ Measured on an RTX 5060 Ti 16 GB (`tiny-long`, `-v 11`, 90 frames):
 | standard | 5.39 s, peak 5.48 GiB | 21.88 s, peak 11.58 GiB |
 | `--accel` | 3.94 s (1.37×), peak 4.06 GiB | 15.57 s (1.41×), peak 10.18 GiB |
 
+A full real-world run on the same GPU (640×480 → 1280×960, scale 2, 4929 frames, `-m tiny-long --color-fix --pad-align`) took **25 min 39 s** without `--accel` and **17 min 36 s** with it (**1.46×**). Other GPU work running at the same time (e.g. video playback) noticeably reduces the gain.
+
 - **Requirements:** FlashVSR v1.1 weights (`-v 11`), an FP8-capable NVIDIA GPU (sm89+: RTX 40 series or newer) and `--dtype bf16` (the default). The FP8 convolutions also need `nvidia-cudnn-frontend` (a regular dependency) with cuDNN ≥ 9.17 (bundled with the cu130 torch wheel).
 - **FlashVSR v1.0 (`-v 10`) is not supported:** the FP8 calibration and the quality checks were done on v1.1 only, so with `-v 10` every part is skipped (one-line warning) and the standard path runs.
 - **Automatic fallback:** at startup each part is checked (GPU, dtype, libraries, a trial build and a warmup run). A part that can't run is skipped with a one-line warning and the standard code path runs instead; if every part is skipped, the output is bit-identical to a run without `--accel`. A part that fails in the middle of a run is switched off for the rest of that process.
