@@ -24,6 +24,8 @@ dependencies = [
     "hf-xet",
     'triton; platform_system != "Windows"',
     'triton-windows; platform_system == "Windows"',
+    # FP8 convolutions (FLASHVSR_FP8_CONV); imported lazily, optional at runtime.
+    "nvidia-cudnn-frontend>=1.29.0",
 ]
 
 [project.scripts]
@@ -33,7 +35,7 @@ flashvsr-cli = "run:cli_entry"
 py-modules = ["run", "webui"]
 
 [tool.setuptools.packages.find]
-include = ["src", "src.*", "vsrlib"]
+include = ["src", "src.*", "vsrlib", "vsrlib.*"]
 namespaces = true          # src/models/sparse_sage has no __init__.py
 exclude = ["*.__pycache__"]
 

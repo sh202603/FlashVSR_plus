@@ -281,7 +281,7 @@ def stitch_video_tiles(
             except OSError as e:
                 log(f"Could not remove temporary file '{path}': {e}", message_type='warning')
 
-def init_pipeline(model, mode, device, dtype):
+def init_pipeline(model, mode, device, dtype, accel=False, accel_shape=None):
     model_downlod(model_name="JunhaoZhuang/"+model)
     model_path = os.path.join(ROOT_DIR, "models", model)
     ckpt_path, vae_path, lq_path, tcd_path, prompt_path = [os.path.join(model_path, f) for f in ["diffusion_pytorch_model_streaming_dmd.safetensors", "Wan2.1_VAE.pth", "LQ_proj_in.ckpt", "TCDecoder.ckpt", "../posi_prompt.pth"]]
@@ -298,6 +298,15 @@ def init_pipeline(model, mode, device, dtype):
         pipe.denoising_model().LQ_proj_in = Causal_LQ4x_Proj(in_dim=3, out_dim=1536, layer_num=1).to(device, dtype=dtype)
     if os.path.exists(lq_path): pipe.denoising_model().LQ_proj_in.load_state_dict(torch.load(lq_path, map_location="cpu"), strict=True)
     pipe.to(device, dtype=dtype); pipe.enable_vram_management(); pipe.init_cross_kv(prompt_path=prompt_path); pipe.load_models_to_device(["dit", "vae"])
+    # Acceleration is shared with the CLI (vsrlib.accel) rather than duplicated:
+    # its checks, fallback and runtime demotion must behave the same everywhere.
+    # The checkbox requests every part; FLASHVSR_* env vars still apply (=0
+    # removes one). install() also runs when off, clearing hooks an earlier
+    # accelerated run left in this process.
+    from vsrlib import accel as vsr_accel
+    version = "10" if model == "FlashVSR" else "11"
+    plan = vsr_accel.preflight(device, dtype, mode, version, enable_all=accel)
+    pipe.accel_parts = vsr_accel.install(pipe, plan, version, accel_shape)
     return pipe
 
 # --- Integrated core logic function (Updated Version) ---
@@ -322,6 +331,7 @@ def run_flashvsr_integrated(
     kv_ratio,     # New
     local_range,  # New
     pad_align=False,
+    accel=False,
     progress=gr.Progress(track_tqdm=True)
 ):
     if not input_path: raise gr.Error("Please provide an input video or image folder path!")
@@ -368,8 +378,10 @@ def run_flashvsr_integrated(
     if tiled_dit:
         N, H, W, C = frames.shape
         progress(0.1, desc="Initializing model pipeline...")
-        pipe = init_pipeline(model, mode, _device, dtype)
         tile_coords = calculate_tile_coords(H, W, tile_size, tile_overlap)
+        _x1, _y1, _x2, _y2 = tile_coords[0]
+        pipe = init_pipeline(model, mode, _device, dtype, accel=accel,
+                             accel_shape=get_input_params(frames[:, _y1:_y2, _x1:_x2, :], scale)[:2])
         
         if mode == "tiny-long":
             local_temp_dir = os.path.join(TEMP_DIR, str(uuid.uuid4())); os.makedirs(local_temp_dir, exist_ok=True)
@@ -412,7 +424,8 @@ def run_flashvsr_integrated(
             final_output_tensor = final_output_canvas / weight_sum_canvas
     else: # Non-tiled mode
         progress(0.1, desc="Initializing model pipeline...")
-        pipe = init_pipeline(model, mode, _device, dtype)
+        pipe = init_pipeline(model, mode, _device, dtype, accel=accel,
+                             accel_shape=get_input_params(frames, scale, pad_align=pad_align)[:2])
         log(f"Processing {frame_count} frames...", message_type='info')
 
         pad_crop_rect = None
@@ -469,6 +482,8 @@ def create_ui():
                     with gr.Row():
                         scale_slider = gr.Slider(minimum=2, maximum=4, step=1, value=4, label="Upscale Factor")
                         tiled_dit_checkbox = gr.Checkbox(label="Enable Tiled DiT", info="For very high-resolution videos or low VRAM scenarios", value=False)
+                    with gr.Row():
+                        accel_checkbox = gr.Checkbox(label="Acceleration (FP8 + fused kernels)", info="RTX 40 series or newer with bf16; falls back to the standard path automatically. Output differs slightly from a run without it", value=False)
                     with gr.Row(visible=False) as tiled_dit_options:
                         tile_size_slider = gr.Slider(minimum=64, maximum=512, step=16, value=256, label="Tile Size")
                         tile_overlap_slider = gr.Slider(minimum=8, maximum=128, step=8, value=24, label="Tile Overlap")
@@ -503,7 +518,7 @@ def create_ui():
                 tiled_dit_checkbox, tile_size_slider, tile_overlap_slider, unload_dit_checkbox,
                 dtype_radio, seed_number, device_textbox, fps_number, quality_slider, attention_mode_radio,
                 sparse_ratio_slider, kv_ratio_slider, local_range_slider, # Added new parameters
-                pad_align_checkbox
+                pad_align_checkbox, accel_checkbox
             ],
             outputs=[video_output]
         )

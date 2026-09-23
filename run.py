@@ -26,6 +26,7 @@ parser.add_argument("--temp-quality", type=int, default=8, choices=range(1, 11),
 parser.add_argument("--kv-ratio", type=int, default=3, help="KV cache length of sparse attention; lower saves VRAM at some quality cost, default=3")
 parser.add_argument("--pad-align", action="store_true", help="Pad the upscaled frame to the next multiple of 128 instead of center-cropping, then crop the output back to exactly scale*input size — preserves frame edges on non-tiled runs (tiled-DiT already preserves them)")
 parser.add_argument("--resume", action="store_true", help="Resume an interrupted tiled tiny-long run: keep _temp at startup and reuse completed tile videos from a previous run with identical parameters")
+parser.add_argument("--accel", action="store_true", help="Speed up inference with FP8 convolutions/linears and fused DiT kernels (RTX 40 series or newer, bf16; falls back to the standard path automatically). Same as FLASHVSR_ACCEL=1; the output differs slightly from a run without it")
 parser.add_argument("output_folder", type=str, help="Path to save output video")
 args = parser.parse_args()
 
@@ -99,6 +100,10 @@ def cli_entry():
         dtype = dtype_map[args.dtype]
     except:
         dtype = torch.bfloat16
+
+    if args.accel:
+        # vsrlib.accel reads the environment (so external workers can opt in too)
+        os.environ["FLASHVSR_ACCEL"] = "1"
 
     if args.attention == "sage":
         wan_video_dit.USE_BLOCK_ATTN = False

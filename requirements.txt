@@ -14,3 +14,4 @@ huggingface_hub
 hf-xet
 triton; platform_system!="Windows"
 triton-windows; platform_system=="Windows"
+nvidia-cudnn-frontend>=1.29.0

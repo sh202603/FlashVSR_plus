@@ -33,6 +33,7 @@
 - `--resume`: crash recovery for tiled `tiny-long` runs — completed tile videos from an interrupted run are detected and reused on re-run.  
 - New low-VRAM CLI knobs: `--output-height`, `--temp-quality`, `--kv-ratio`.  
 - uv packaging: `uv sync` sets up the whole environment and installs the `flashvsr-cli` console command.  
+- `--accel` (web UI: *"Acceleration"* checkbox): ~1.6× faster inference with FP8 convolutions/linears and fused DiT kernels, and 1–2 GiB less VRAM, on RTX 40 series or newer. Other GPUs fall back to the standard path automatically (see *Acceleration* below).  
 
 ---
 ### 🚀 Getting Started
@@ -124,6 +125,35 @@ flashvsr-cli -i input.mp4 -m tiny-long --tiled-dit --tile-size 192 --overlap 24 
 - If a long run crashes or is killed, re-run the same command with `--resume`: completed tiles are verified and skipped, and if all tiles were done the run goes straight to stitching. Changing any parameter that affects tile content (input, seed, tile size, …) starts a fresh tile set instead; stale tiles are cleaned up by the next run without `--resume`.
 - Throughput reality: a 1080p input is split into 84 tiles at tile 192 — measured pace extrapolates to roughly **a day (~23h) per 10 minutes of video** on an RTX 5080. For a ~4× faster, lower-fidelity pass, downscale the input to 540p first and let the 4x model produce 2160p directly.
 - Constant-frame-rate input is recommended; VFR sources may end with a few duplicated tail frames.
+
+#### ⚡ Acceleration (`--accel`)
+
+```bash
+flashvsr-cli -i input.mp4 -m tiny-long -v 11 --accel ./
+```
+
+`--accel` (or the environment variable `FLASHVSR_ACCEL=1`) swaps in four faster implementations:
+
+| Part | What runs faster | Environment variable |
+|---|---|---|
+| FP8 convolutions | TCDecoder and LQ projector convolutions in FP8 (cuDNN graph API) | `FLASHVSR_FP8_CONV` |
+| FP8 DiT | DiT linears and FFN in FP8 | `FLASHVSR_FP8_DIT` |
+| Fused DiT | RMSNorm+RoPE and AdaLN as fused Triton kernels | `FLASHVSR_FUSED_DIT` |
+
+Setting a part's variable to `1` enables just that part; `0` removes it even under `--accel`. The DiT parts come from [flashvsr-sm89-ops](https://github.com/aireet/flashvsr-sm89-ops) (vendored in `vsrlib/sm89_ops/`, Apache-2.0).
+
+Measured on an RTX 5060 Ti 16 GB (`tiny-long`, `-v 11`, 90 frames):
+
+| | 256² → 512² (scale 2) | 256² → 1024² (scale 4) |
+|---|---|---|
+| standard | 5.42 s, peak 5.48 GiB | 21.76 s, peak 11.58 GiB |
+| `--accel` | 3.32 s (1.63×), peak 4.35 GiB | 13.08 s (1.66×), peak 9.47 GiB |
+
+- **Requirements:** an FP8-capable NVIDIA GPU (sm89+: RTX 40 series or newer) and `--dtype bf16` (the default). The FP8 convolutions also need `nvidia-cudnn-frontend` (a regular dependency) with cuDNN ≥ 9.17 (bundled with the cu130 torch wheel) and a calibration table for the model version, which currently exists for `-v 11` only.
+- **Automatic fallback:** at startup each part is checked (GPU, dtype, libraries, a trial build and a warmup run). A part that can't run is skipped with a one-line warning and the standard code path runs instead; if every part is skipped, the output is bit-identical to a run without `--accel`. A part that fails in the middle of a run is switched off for the rest of that process.
+- **Output:** the result differs slightly from a standard run (FP8 rounding; the sparse attention amplifies tiny numeric differences). In our checks the flow-warping error stayed within 1.2× of the standard run, mostly driven by the FP8 TCDecoder; if you see flicker, try `FLASHVSR_FP8_CONV=0`.
+- **`--resume`:** the active parts are part of the tile-set fingerprint, so tiles made with different acceleration settings are never mixed. Resuming with the same settings reuses completed tiles.
+- The web UI has the same option as the *"Acceleration"* checkbox. `full` mode decodes with the Wan VAE, so only the LQ projector's convolutions run in FP8 there.
 
 ---
 

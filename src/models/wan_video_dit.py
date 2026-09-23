@@ -39,6 +39,14 @@ import numpy as np
 
 USE_BLOCK_ATTN = False
 
+# Optional fused-kernel hooks, installed by vsrlib.accel (FLASHVSR_FUSED_DIT).
+# None runs the stock ops; when set they replace them in SelfAttention/DiTBlock:
+#   FUSED_ROPE_FN(x, norm, freqs, num_heads)       == rope_apply(norm(x), freqs, num_heads)
+#   FUSED_ADALN = (ln_modulate(x, norm, shift, scale) == modulate(norm(x), shift, scale),
+#                  gate_add(x, gate, residual)          == x + gate * residual)
+FUSED_ROPE_FN = None
+FUSED_ADALN = None
+
 # ----------------------------
 # Local / window masks
 # ----------------------------
@@ -387,11 +395,16 @@ class SelfAttention(nn.Module):
             assert f==6, " start f must be 6"
         assert L == f * h * w, "Sequence length mismatch with provided (f,h,w)."
 
-        q = self.norm_q(self.q(x))
-        k = self.norm_k(self.k(x))
-        v = self.v(x)
-        q = rope_apply(q, freqs, self.num_heads)
-        k = rope_apply(k, freqs, self.num_heads)
+        if FUSED_ROPE_FN is None:
+            q = self.norm_q(self.q(x))
+            k = self.norm_k(self.k(x))
+            v = self.v(x)
+            q = rope_apply(q, freqs, self.num_heads)
+            k = rope_apply(k, freqs, self.num_heads)
+        else:
+            q = FUSED_ROPE_FN(self.q(x), self.norm_q, freqs, self.num_heads)
+            k = FUSED_ROPE_FN(self.k(x), self.norm_k, freqs, self.num_heads)
+            v = self.v(x)
 
         win = (2, 8, 8)
         q = q.view(B, f, h, w, D)
@@ -526,16 +539,26 @@ class DiTBlock(nn.Module):
                 is_stream=False, pre_cache_k=None, pre_cache_v=None, local_range = 9):
         shift_msa, scale_msa, gate_msa, shift_mlp, scale_mlp, gate_mlp = (
             self.modulation.to(dtype=t_mod.dtype, device=t_mod.device) + t_mod).chunk(6, dim=1)
-        input_x = modulate(self.norm1(x), shift_msa, scale_msa)
+        if FUSED_ADALN is None:
+            input_x = modulate(self.norm1(x), shift_msa, scale_msa)
+        else:
+            input_x = FUSED_ADALN[0](x, self.norm1, shift_msa, scale_msa)
         self_attn_output, self_attn_cache_k, self_attn_cache_v = self.self_attn(
             input_x, freqs, f, h, w, local_num, topk, train_img, block_id,
             kv_len=kv_len, is_full_block=is_full_block, is_stream=is_stream,
             pre_cache_k=pre_cache_k, pre_cache_v=pre_cache_v, local_range = local_range)
 
-        x = self.gate(x, gate_msa, self_attn_output)
+        if FUSED_ADALN is None:
+            x = self.gate(x, gate_msa, self_attn_output)
+        else:
+            x = FUSED_ADALN[1](x, gate_msa, self_attn_output)
         x = x + self.cross_attn(self.norm3(x), context, is_stream=is_stream)
-        input_x = modulate(self.norm2(x), shift_mlp, scale_mlp)
-        x = self.gate(x, gate_mlp, self.ffn(input_x))
+        if FUSED_ADALN is None:
+            input_x = modulate(self.norm2(x), shift_mlp, scale_mlp)
+            x = self.gate(x, gate_mlp, self.ffn(input_x))
+        else:
+            input_x = FUSED_ADALN[0](x, self.norm2, shift_mlp, scale_mlp)
+            x = FUSED_ADALN[1](x, gate_mlp, self.ffn(input_x))
         if is_stream:
             return x, self_attn_cache_k, self_attn_cache_v
         return x

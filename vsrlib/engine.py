@@ -10,6 +10,7 @@ from src.models.TCDecoder import build_tcdecoder
 from src.models.utils import get_device_list, clean_vram, Buffer_LQ4x_Proj, Causal_LQ4x_Proj
 
 from .common import log, root, temp
+from . import accel
 from .media_io import model_downlod, is_video, probe_input, prepare_tensors, count_video_frames
 from .preprocess import (
     tensor2video, largest_8n1_leq, next_8n5, compute_scaled_and_padded_dims,
@@ -27,7 +28,11 @@ def _cli_fps():
     import run
     return run.args.fps
 
-def init_pipeline(version, mode, device, dtype):
+def init_pipeline(version, mode, device, dtype, accel_plan=None, accel_shape=None):
+    """Build the pipeline. `accel_plan` is vsrlib.accel.preflight()'s result (None:
+    run the preflight here from the environment — the path external workers take);
+    `accel_shape` = (height, width) of the frames the pipeline will see, used to
+    warm up the accelerated parts. The active parts end up in `pipe.accel_parts`."""
     if version == "10":
         model = "FlashVSR"
     else:
@@ -78,6 +83,11 @@ def init_pipeline(version, mode, device, dtype):
     pipe.init_cross_kv(prompt_path=prompt_path)
     pipe.load_models_to_device(["dit","vae"])
 
+    # Always install, even with an empty plan: it also clears hooks left by an
+    # earlier pipeline in this process.
+    if accel_plan is None:
+        accel_plan = accel.preflight(device, dtype, mode, version)
+    pipe.accel_parts = accel.install(pipe, accel_plan, version, accel_shape)
     return pipe
 
 def main(input, version, mode, scale, color_fix, tiled_vae, tiled_dit, tile_size, tile_overlap, unload_dit, dtype, sparse_ratio=2, kv_ratio=3, local_range=11, seed=0, device="auto", quality=6, output=None, output_height=None, temp_quality=8, pad_align=False, resume=False):
@@ -97,6 +107,11 @@ def main(input, version, mode, scale, color_fix, tiled_vae, tiled_dit, tile_size
         raise ValueError(f'"tile_size" x scale must be a multiple of 128, otherwise tiles get center-cropped and stitching misaligns (for scale {scale} use e.g. {", ".join(str(t) for t in (128, 160, 192, 224, 256) if (t * scale) % 128 == 0)}).')
     if resume and not (tiled_dit and mode == "tiny-long"):
         log("[FlashVSR] --resume only affects --tiled-dit with -m tiny-long; continuing as a normal run.", message_type='warning')
+
+    # Acceleration checks that need no model (env, GPU, dtype, libraries). Done
+    # up front because the parts change the output and so key the --resume
+    # manifest, which must exist before the model is (possibly not) loaded.
+    accel_plan = accel.preflight(_device, dtype, mode, version)
 
     if mode == "tiny-long":
         # tiny-long streams frames from disk per tile instead of preloading the whole
@@ -142,18 +157,25 @@ def main(input, version, mode, scale, color_fix, tiled_vae, tiled_dit, tile_size
         tile_coords = calculate_tile_coords(H, W, tile_size, tile_overlap)
         latent_tiles_cpu = []
         temp_videos = []
+        _x1, _y1, _x2, _y2 = tile_coords[0]
+        accel_shape = get_input_params_from_dims(N0, _y2 - _y1, _x2 - _x1, scale)[:2]
 
-        completed_tiles = set()
-        if mode == "tiny-long":
+        def open_tile_dir(accel_parts):
             manifest = build_resume_manifest(
                 kind, input, source, N0, h0, w0, scale, tile_size, tile_overlap, seed,
                 version, mode, str(dtype), kv_ratio, local_range, color_fix, sparse_ratio,
                 temp_quality, attention="block" if wan_video_dit.USE_BLOCK_ATTN else "sage",
-                fps=_fps, num_tiles=len(tile_coords))
-            local_temp = os.path.join(temp, "tiles_" + resume_manifest_hash(manifest))
-            if prepare_resume_dir(local_temp, manifest, resume):
-                completed_tiles = scan_completed_tiles(local_temp, len(tile_coords))
-                log(f"[FlashVSR] Resume: {len(completed_tiles)}/{len(tile_coords)} tiles already complete, {len(tile_coords) - len(completed_tiles)} to compute.", message_type='info')
+                fps=_fps, num_tiles=len(tile_coords), accel=accel.manifest_value(accel_parts))
+            tile_dir = os.path.join(temp, "tiles_" + resume_manifest_hash(manifest))
+            done = set()
+            if prepare_resume_dir(tile_dir, manifest, resume):
+                done = scan_completed_tiles(tile_dir, len(tile_coords))
+                log(f"[FlashVSR] Resume: {len(done)}/{len(tile_coords)} tiles already complete, {len(tile_coords) - len(done)} to compute.", message_type='info')
+            return tile_dir, done
+
+        completed_tiles = set()
+        if mode == "tiny-long":
+            local_temp, completed_tiles = open_tile_dir(accel_plan)
 
         if _device.startswith("cuda"):
             free_b, total_b = torch.cuda.mem_get_info()
@@ -176,7 +198,13 @@ def main(input, version, mode, scale, color_fix, tiled_vae, tiled_dit, tile_size
             log("[FlashVSR] All tiles already complete — skipping model load, going straight to stitching.", message_type='info')
             pipe = None
         else:
-            pipe = init_pipeline(version, mode, _device, dtype)
+            pipe = init_pipeline(version, mode, _device, dtype, accel_plan=accel_plan, accel_shape=accel_shape)
+            if mode == "tiny-long" and pipe.accel_parts != accel_plan:
+                # A part failed its warmup, so the tiles will not match the plan
+                # the tile dir was keyed with. No tile has been computed yet:
+                # re-key (the unused dir is cleaned by the next non-resume run).
+                log("[FlashVSR] Acceleration parts changed during warmup; re-keying the tile directory.", message_type='info')
+                local_temp, completed_tiles = open_tile_dir(pipe.accel_parts)
             if _device.startswith("cuda"):
                 torch.cuda.reset_peak_memory_stats()
 
@@ -214,7 +242,7 @@ def main(input, version, mode, scale, color_fix, tiled_vae, tiled_dit, tile_size
             temp_videos.append(temp_name)
             if mode == "tiny-long":
                 if output_tile_gpu is not True:
-                    raise RuntimeError(f"[FlashVSR] Tile {i+1}/{len(tile_coords)} failed — see the error above.")
+                    raise RuntimeError(f"[FlashVSR] Tile {i+1}/{len(tile_coords)} failed — see the error above." + accel.failure_hint())
                 # Written on every run, not just --resume ones: the run that crashes
                 # is usually the one started without the flag. Records the measured
                 # frame count — the pipeline emits fewer frames than its padded input
@@ -275,7 +303,7 @@ def main(input, version, mode, scale, color_fix, tiled_vae, tiled_dit, tile_size
             LQ, th, tw, F = prepare_input_tensor(frames, _device, scale=scale, dtype=dtype, pad_align=pad_align)
             LQ = LQ.to(_device)
 
-        pipe = init_pipeline(version, mode, _device, dtype)
+        pipe = init_pipeline(version, mode, _device, dtype, accel_plan=accel_plan, accel_shape=(th, tw))
         log(f"[FlashVSR] Processing {frame_count} frames...", message_type='info')
         video = pipe(
             prompt="", negative_prompt="", cfg_scale=1.0, num_inference_steps=1, seed=seed, tiled=tiled_vae,
@@ -287,7 +315,7 @@ def main(input, version, mode, scale, color_fix, tiled_vae, tiled_dit, tile_size
 
         if mode == "tiny-long":
             if video is not True:
-                raise RuntimeError("[FlashVSR] Pipeline failed — see the error above.")
+                raise RuntimeError("[FlashVSR] Pipeline failed — see the error above." + accel.failure_hint())
             del pipe, LQ
             clean_vram()
             return video, _fps

@@ -20,12 +20,16 @@ def _input_fingerprint(kind, input_path, source):
 def build_resume_manifest(kind, input_path, source, frame_count, height, width, scale,
                           tile_size, tile_overlap, seed, version, mode, dtype, kv_ratio,
                           local_range, color_fix, sparse_ratio, temp_quality, attention,
-                          fps=None, num_tiles=None):
+                          fps=None, num_tiles=None, accel=None):
     """"params" holds everything that affects tile pixels, coords, ordering or count —
     two runs with equal params produce interchangeable tile videos. Stitch-only
     settings (output path/quality/height, fps) must stay out of "params" so changing
-    them doesn't discard resumable tiles; "info" is for human inspection only."""
-    return {
+    them doesn't discard resumable tiles; "info" is for human inspection only.
+
+    `accel` is vsrlib.accel.manifest_value() of the acceleration parts actually
+    active (they change the output). None omits the key, so runs without
+    acceleration keep the hash they had before the key existed."""
+    manifest = {
         "format": 1,
         "params": {
             "input": _input_fingerprint(kind, input_path, source),
@@ -52,6 +56,9 @@ def build_resume_manifest(kind, input_path, source, frame_count, height, width, 
             "created_at": datetime.datetime.now().isoformat(timespec="seconds"),
         },
     }
+    if accel:
+        manifest["params"]["accel"] = list(accel)
+    return manifest
 
 def resume_manifest_hash(manifest):
     blob = json.dumps(manifest["params"], sort_keys=True, ensure_ascii=True).encode("utf-8")
