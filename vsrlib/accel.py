@@ -85,7 +85,10 @@ def preflight(device, dtype, mode, version, enable_all=False):
             _warn(f"[FlashVSR] accel: {', '.join(which)} disabled: {reason}; using the standard path.")
 
     dev = torch.device(device)
-    if dev.type != "cuda":
+    if str(version) != "11":
+        # Validated (quality gate, calibration) on FlashVSR v1.1 only.
+        drop(PARTS, "supports FlashVSR v1.1 (-v 11) only")
+    elif dev.type != "cuda":
         drop(PARTS, "needs a CUDA device")
     elif dtype != torch.bfloat16:
         drop(PARTS, "needs --dtype bf16")

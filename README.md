@@ -33,7 +33,7 @@
 - `--resume`: crash recovery for tiled `tiny-long` runs — completed tile videos from an interrupted run are detected and reused on re-run.  
 - New low-VRAM CLI knobs: `--output-height`, `--temp-quality`, `--kv-ratio`.  
 - uv packaging: `uv sync` sets up the whole environment and installs the `flashvsr-cli` console command.  
-- `--accel` (web UI: *"Acceleration"* checkbox): ~1.6× faster inference with FP8 convolutions/linears and fused DiT kernels, and 1–2 GiB less VRAM, on RTX 40 series or newer. Other GPUs fall back to the standard path automatically (see *Acceleration* below).  
+- `--accel` (web UI: *"Acceleration"* checkbox): ~1.6× faster inference with FP8 convolutions/linears and fused DiT kernels, and 1–2 GiB less VRAM, on RTX 40 series or newer with FlashVSR v1.1 (`-v 11`). Other GPUs and `-v 10` fall back to the standard path automatically (see *Acceleration* below).  
 
 ---
 ### 🚀 Getting Started
@@ -132,7 +132,7 @@ flashvsr-cli -i input.mp4 -m tiny-long --tiled-dit --tile-size 192 --overlap 24 
 flashvsr-cli -i input.mp4 -m tiny-long -v 11 --accel ./
 ```
 
-`--accel` (or the environment variable `FLASHVSR_ACCEL=1`) swaps in four faster implementations:
+`--accel` (or the environment variable `FLASHVSR_ACCEL=1`) swaps in three groups of faster implementations:
 
 | Part | What runs faster | Environment variable |
 |---|---|---|
@@ -149,7 +149,8 @@ Measured on an RTX 5060 Ti 16 GB (`tiny-long`, `-v 11`, 90 frames):
 | standard | 5.42 s, peak 5.48 GiB | 21.76 s, peak 11.58 GiB |
 | `--accel` | 3.32 s (1.63×), peak 4.35 GiB | 13.08 s (1.66×), peak 9.47 GiB |
 
-- **Requirements:** an FP8-capable NVIDIA GPU (sm89+: RTX 40 series or newer) and `--dtype bf16` (the default). The FP8 convolutions also need `nvidia-cudnn-frontend` (a regular dependency) with cuDNN ≥ 9.17 (bundled with the cu130 torch wheel) and a calibration table for the model version, which currently exists for `-v 11` only.
+- **Requirements:** FlashVSR v1.1 weights (`-v 11`), an FP8-capable NVIDIA GPU (sm89+: RTX 40 series or newer) and `--dtype bf16` (the default). The FP8 convolutions also need `nvidia-cudnn-frontend` (a regular dependency) with cuDNN ≥ 9.17 (bundled with the cu130 torch wheel).
+- **FlashVSR v1.0 (`-v 10`) is not supported:** the FP8 calibration and the quality checks were done on v1.1 only, so with `-v 10` every part is skipped (one-line warning) and the standard path runs.
 - **Automatic fallback:** at startup each part is checked (GPU, dtype, libraries, a trial build and a warmup run). A part that can't run is skipped with a one-line warning and the standard code path runs instead; if every part is skipped, the output is bit-identical to a run without `--accel`. A part that fails in the middle of a run is switched off for the rest of that process.
 - **Output:** the result differs slightly from a standard run (FP8 rounding; the sparse attention amplifies tiny numeric differences). In our checks the flow-warping error stayed within 1.2× of the standard run, mostly driven by the FP8 TCDecoder; if you see flicker, try `FLASHVSR_FP8_CONV=0`.
 - **`--resume`:** the active parts are part of the tile-set fingerprint, so tiles made with different acceleration settings are never mixed. Resuming with the same settings reuses completed tiles.
@@ -171,6 +172,7 @@ We gratefully acknowledge the following open-source projects:
 * **DiffSynth Studio** — [https://github.com/modelscope/DiffSynth-Studio](https://github.com/modelscope/DiffSynth-Studio)
 * **Sparse_SageAttention** — [https://github.com/jt-zhang/Sparse\_SageAttention_API](https://github.com/jt-zhang/Sparse_SageAttention_API)
 * **taehv** — [https://github.com/madebyollin/taehv](https://github.com/madebyollin/taehv)
+* **flashvsr-sm89-ops** — [https://github.com/aireet/flashvsr-sm89-ops](https://github.com/aireet/flashvsr-sm89-ops) (FP8 linear and fused DiT kernels used by `--accel`, vendored in `vsrlib/sm89_ops/`)
 
 ---
 
